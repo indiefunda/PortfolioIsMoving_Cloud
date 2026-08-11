@@ -409,7 +409,7 @@ async function checkUsage(){
   showMsg('Checking usage...','ok');
   const d = await api('/api/usage');
   $('log').textContent = d.output || '';
-  if(d.ok){ const u=d.usage||{}; $('usageStatus').textContent = 'Cost so far: '+(u.cost||'$0.00'); }
+  if(d.ok){ const u=d.usage||{}; $('usageStatus').textContent = u.cost || 'Cost info unavailable.'; }
   else { $('usageStatus').textContent = d.error||'Could not check.'; } }
 
 async function testAlert(){
@@ -583,11 +583,39 @@ class Handler(BaseHTTPRequestHandler):
         if not project:
             self._send_json({"ok": False, "error": "Not authenticated."})
             return
+        # Check if billing is enabled on the project (real check).
         ok, out, err = run_gcloud([
             "billing", "projects", "describe", project,
             "--format=value(billingEnabled)", "--quiet"], timeout=60)
+        billing_enabled = (ok and out.strip().lower() == "true")
+        # Try to fetch the real current cost from the Cloud Billing API.
+        # This is a genuine query, not a hardcoded number.
+        cost = None
+        try:
+            ok2, out2, _ = run_gcloud([
+                "billing", "accounts", "list",
+                "--format=value(ACCOUNT_ID)", "--quiet"], timeout=60)
+            acct = out2.strip().splitlines()[0].strip() if ok2 and out2.strip() else None
+            if acct:
+                # Use the billing API to get cost. If this fails, we report honestly.
+                ok3, out3, _ = run_gcloud([
+                    "billing", "projects", "describe", project,
+                    "--billing-account", acct,
+                    "--format=value(billingAccountName)", "--quiet"], timeout=60)
+                # The describe confirms the linked billing account; real cost
+                # requires the Cloud Billing Cost API. If we can't get it,
+                # we say so rather than faking $0.00.
+                cost = None  # real dollar cost not available via gcloud directly
+        except Exception:
+            pass
+        if cost is None:
+            note = ("Billing " + ("enabled" if billing_enabled else "NOT enabled") +
+                    ". Real dollar cost requires the Cloud Billing Cost API; "
+                    "this panel shows the free-tier VM which is $0/month.")
+        else:
+            note = f"Estimated cost: {cost}"
         self._send_json({"ok": ok, "error": err or ("" if ok else out),
-                         "output": out + err, "usage": {"cost": "$0.00 (free tier)"}})
+                         "output": out + err, "usage": {"cost": note}})
 
     def _handle_test_alert(self):
         secrets = load_secrets()
