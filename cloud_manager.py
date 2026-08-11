@@ -548,14 +548,21 @@ class Handler(BaseHTTPRequestHandler):
         if not project:
             self._send_json({"ok": False, "error": "Not authenticated."})
             return
-        # Create/update a $1 budget alert via the billing API
+        # Find the actual billing account ID
+        ok, out, _ = run_gcloud(["billing", "accounts", "list",
+                                 "--format=value(ACCOUNT_ID)", "--quiet"], timeout=60)
+        acct = out.strip().splitlines()[0].strip() if ok and out.strip() else None
+        if not acct:
+            self._send_json({"ok": False, "error": "No billing account found. Link a billing account in Google Cloud first."})
+            return
+        # Create a $1 budget alert (percent-based thresholds only).
         ok, out, err = run_gcloud([
             "billing", "budgets", "create",
-            "--billing-account", "default",
+            "--billing-account", acct,
             "--display-name", "portfolioismoving-alert",
             "--budget-amount", "1",
-            "--threshold-rule", "spend=0.50,percent=50",
-            "--threshold-rule", "spend=0.90,percent=90",
+            "--threshold-rule", "percent=50",
+            "--threshold-rule", "percent=90",
             "--quiet"], timeout=120)
         self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
 
