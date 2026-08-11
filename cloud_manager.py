@@ -559,6 +559,14 @@ class Handler(BaseHTTPRequestHandler):
         if not acct:
             self._send_json({"ok": False, "error": "No billing account found. Link a billing account in Google Cloud first."})
             return
+        # Check if a budget with our name already exists. If so, don't create a duplicate.
+        ok2, out2, _ = run_gcloud([
+            "billing", "budgets", "list", "--billing-account", acct,
+            "--format=value(displayName)", "--quiet"], timeout=60)
+        if ok2 and "portfolioismoving-alert" in out2:
+            self._send_json({"ok": True, "error": "",
+                             "output": "Budget alert already set ($1/month). No duplicate was created."})
+            return
         # Create a $1 budget alert (percent-based thresholds only).
         ok, out, err = run_gcloud([
             "billing", "budgets", "create",
