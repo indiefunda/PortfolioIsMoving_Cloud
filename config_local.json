@@ -1,0 +1,6 @@
+{
+  "tickers": ["HUIZ", "YB", "LX", "CAAS", "QFIN", "LU"],
+  "threshold_pct": 5.0,
+  "enabled": true,
+  "provider": "finnhub"
+}

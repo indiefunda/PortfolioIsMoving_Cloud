@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Secrets (never commit your bot token or chat id)
+secrets_local.json
+.env
+*.env
+
+# Runtime state
+state.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Generated zip packages
+*.zip
