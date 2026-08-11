@@ -518,8 +518,13 @@ class Handler(BaseHTTPRequestHandler):
         zone = find_vm_zone()
         if not zone:
             return False, "", "VM not found."
+        # Resolve the VM's home directory (pscp can't use ~/ as a target).
+        ok, home, _ = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", "echo $HOME", "--quiet"], timeout=60)
+        home = home.strip() if ok and home.strip() else "/home/Achilles"
         out, err = "", ""
-        # scp the needed files
+        # scp the needed files to the absolute home path
         files = ["monitor.py", "requirements.txt", "setup_cloud.sh",
                  "config_local.json", "secrets_local.json"]
         for f in files:
@@ -527,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.exists(src):
                 ok, o, e = run_gcloud([
                     "compute", "scp", "--zone", zone, src,
-                    f"{VM_NAME}:~/{f}", "--quiet"], timeout=120)
+                    f"{VM_NAME}:{home}/", "--quiet"], timeout=120)
                 out += o; err += e
                 if not ok:
                     return False, out, err
