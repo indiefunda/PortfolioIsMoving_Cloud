@@ -445,6 +445,18 @@ class Handler(BaseHTTPRequestHandler):
         if not project:
             self._send_json({"ok": False, "error": "Not authenticated. Click 'Authenticate to Google' first."})
             return
+
+        # Check if the VM already exists. If it does, don't create a duplicate.
+        existing = vm_status()
+        if existing:
+            # VM already there - just (re)deploy the config so it's up to date.
+            ok, out, err = self._deploy_to_vm(project)
+            msg = (f"Server already exists (status: {existing}). "
+                   f"Config re-uploaded - no duplicate was created.")
+            self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                             "output": msg + "\n" + out + err})
+            return
+
         ok, out, err = run_gcloud([
             "compute", "instances", "create", VM_NAME,
             "--zone", VM_ZONE, "--machine-type", VM_MACHINE,
