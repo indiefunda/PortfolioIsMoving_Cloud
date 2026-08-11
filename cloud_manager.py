@@ -129,10 +129,17 @@ def run_gcloud(args, timeout=120):
 
 
 def get_project():
-    """Return the current gcloud project id, or None."""
+    """Return the current gcloud project id, auto-selecting one if none is set."""
     ok, out, _ = run_gcloud(["config", "get-value", "project", "--quiet"])
     if ok and out.strip() and out.strip() != "(unset)":
         return out.strip()
+    # No active project - try to pick the first available one automatically.
+    ok2, out2, _ = run_gcloud(["projects", "list", "--format=value(projectId)",
+                               "--limit=1", "--quiet"], timeout=60)
+    if ok2 and out2.strip():
+        project = out2.strip().splitlines()[0].strip()
+        run_gcloud(["config", "set", "project", project, "--quiet"], timeout=60)
+        return project
     return None
 
 
