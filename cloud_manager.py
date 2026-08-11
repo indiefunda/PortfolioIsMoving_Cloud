@@ -34,6 +34,21 @@ VM_MACHINE = "e2-micro"
 VM_IMAGE = "debian-12"
 VM_PROJECT = None              # set after auth via gcloud config
 
+# Zones that offer the free e2-micro machine type. The app tries each in
+# order until one has capacity (some zones run out temporarily).
+VM_ZONES = [
+    "us-central1-a",
+    "us-central1-b",
+    "us-central1-c",
+    "us-east1-b",
+    "us-east1-c",
+    "us-west1-a",
+    "us-west1-b",
+    "us-east4-a",
+    "us-east4-b",
+    "us-east4-c",
+]
+
 DEFAULT_CONFIG = {
     "tickers": [],
     "threshold_pct": 5.0,
@@ -153,13 +168,28 @@ def auth_status():
     return {"installed": True, "authed": bool(account), "account": account}
 
 
-def vm_status():
-    """Return the VM's status, or None if it doesn't exist."""
+def find_vm_zone():
+    """Return the zone where the VM actually lives, or None if it doesn't exist."""
     project = get_project()
     if not project:
         return None
+    # Search all candidate zones for the VM.
+    for zone in VM_ZONES:
+        ok, out, _ = run_gcloud(
+            ["compute", "instances", "describe", VM_NAME, "--zone", zone,
+             "--format=value(status)", "--quiet"], timeout=60)
+        if ok and out.strip():
+            return zone
+    return None
+
+
+def vm_status():
+    """Return the VM's status, or None if it doesn't exist."""
+    zone = find_vm_zone()
+    if not zone:
+        return None
     ok, out, _ = run_gcloud(
-        ["compute", "instances", "describe", VM_NAME, "--zone", VM_ZONE,
+        ["compute", "instances", "describe", VM_NAME, "--zone", zone,
          "--format=value(status)", "--quiet"], timeout=60)
     if ok and out.strip():
         return out.strip()
@@ -457,21 +487,37 @@ class Handler(BaseHTTPRequestHandler):
                              "output": msg + "\n" + out + err})
             return
 
-        ok, out, err = run_gcloud([
-            "compute", "instances", "create", VM_NAME,
-            "--zone", VM_ZONE, "--machine-type", VM_MACHINE,
-            "--image-family", VM_IMAGE, "--image-project", "debian-cloud",
-            "--boot-disk-size", "10GB", "--tags", "http-server",
-            "--quiet",
-        ], timeout=300)
+        # Try each zone in order until one has capacity for the free e2-micro.
+        ok, out, err = False, "", ""
+        created_zone = None
+        for zone in VM_ZONES:
+            ok, out, err = run_gcloud([
+                "compute", "instances", "create", VM_NAME,
+                "--zone", zone, "--machine-type", VM_MACHINE,
+                "--image-family", VM_IMAGE, "--image-project", "debian-cloud",
+                "--boot-disk-size", "10GB", "--tags", "http-server",
+                "--quiet",
+            ], timeout=300)
+            if ok:
+                created_zone = zone
+                break
+            # If it's not a capacity error, stop trying other zones.
+            if "ZONE_RESOURCE_POOL_EXHAUSTED" not in err and "resource_availability" not in err:
+                break
+
         # Then copy the project files up and run setup
         if ok:
             ok2, out2, err2 = self._deploy_to_vm(project)
             ok = ok2; out += out2; err += err2
+            if created_zone:
+                out = f"(created in zone {created_zone})\n" + out
         self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
 
     def _deploy_to_vm(self, project):
         """Copy monitor files to the VM and run setup_cloud.sh."""
+        zone = find_vm_zone()
+        if not zone:
+            return False, "", "VM not found."
         out, err = "", ""
         # scp the needed files
         files = ["monitor.py", "requirements.txt", "setup_cloud.sh",
@@ -480,14 +526,14 @@ class Handler(BaseHTTPRequestHandler):
             src = os.path.join(BASE_DIR, f)
             if os.path.exists(src):
                 ok, o, e = run_gcloud([
-                    "compute", "scp", "--zone", VM_ZONE, src,
+                    "compute", "scp", "--zone", zone, src,
                     f"{VM_NAME}:~/{f}", "--quiet"], timeout=120)
                 out += o; err += e
                 if not ok:
                     return False, out, err
         # Run setup on the VM
         ok, o, e = run_gcloud([
-            "compute", "ssh", "--zone", VM_ZONE, VM_NAME,
+            "compute", "ssh", "--zone", zone, VM_NAME,
             "--command", "cd ~ && bash setup_cloud.sh", "--quiet"], timeout=300)
         out += o; err += e
         return ok, out, err
@@ -526,8 +572,12 @@ class Handler(BaseHTTPRequestHandler):
         if not token or not chat_id:
             self._send_json({"ok": False, "error": "Telegram token/chat id not set. Fill them in step 3 and upload."})
             return
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
         ok, out, err = run_gcloud([
-            "compute", "ssh", "--zone", VM_ZONE, VM_NAME,
+            "compute", "ssh", "--zone", zone, VM_NAME,
             "--command", "cd ~ && python3 -c \"import monitor; print('sending'); monitor.send_telegram('" + token + "', '" + chat_id + "', '✅ PortfolioIsMoving test alert - server is running!')\"",
             "--quiet"], timeout=120)
         self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
