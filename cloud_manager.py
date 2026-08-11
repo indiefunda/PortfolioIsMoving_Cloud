@@ -83,13 +83,42 @@ def save_secrets(sec): _write_json(SECRETS_FILE, sec)
 # ---------------------------------------------------------------------------
 # gcloud helpers
 # ---------------------------------------------------------------------------
+# Known gcloud install locations (Windows), used if gcloud isn't on PATH.
+GCLOUD_CANDIDATES = [
+    "gcloud",
+    r"C:\Users\Achilles\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"C:\Users\Achilles\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud",
+    r"C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"$LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+]
+
+
+def _find_gcloud():
+    """Return the gcloud command to use, or None if not found."""
+    # 1. On PATH
+    found = shutil.which("gcloud")
+    if found:
+        return found
+    # 2. Known install locations
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    for cand in GCLOUD_CANDIDATES:
+        if cand.startswith("$LOCALAPPDATA") and localappdata:
+            cand = cand.replace("$LOCALAPPDATA", localappdata)
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
 def gcloud_available():
-    return shutil.which("gcloud") is not None
+    return _find_gcloud() is not None
 
 
 def run_gcloud(args, timeout=120):
     """Run a gcloud command and return (success, stdout, stderr)."""
-    cmd = ["gcloud"] + args
+    gcloud = _find_gcloud()
+    if not gcloud:
+        return False, "", "gcloud not found. Install the Google Cloud CLI."
+    cmd = [gcloud] + args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.returncode == 0, proc.stdout, proc.stderr
