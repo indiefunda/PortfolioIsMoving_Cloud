@@ -588,10 +588,41 @@ class Handler(BaseHTTPRequestHandler):
         if not zone:
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
             return
+        # Write a tiny test script locally, scp it up, and run it. This avoids
+        # the fragile nested-quoting of inline python3 -c through SSH.
+        script = (
+            "import monitor\n"
+            "ok = monitor.send_telegram(\n"
+            "    '" + token + "',\n"
+            "    '" + chat_id + "',\n"
+            "    'PortfolioIsMoving test alert - server is running!',\n"
+            ")\n"
+            "print('SENT_OK' if ok else 'SENT_FAIL')\n"
+        )
+        script_path = os.path.join(BASE_DIR, "_test_alert.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(script)
+        # Upload the script
         ok, out, err = run_gcloud([
-            "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", "cd ~ && python3 -c \"import monitor; print('sending'); monitor.send_telegram('" + token + "', '" + chat_id + "', '✅ PortfolioIsMoving test alert - server is running!')\"",
-            "--quiet"], timeout=120)
+            "compute", "scp", "--zone", zone, script_path,
+            f"{VM_NAME}:/home/Achilles/", "--quiet"], timeout=120)
+        # Run it
+        if ok:
+            ok2, out2, err2 = run_gcloud([
+                "compute", "ssh", "--zone", zone, VM_NAME,
+                "--command", "cd /home/Achilles && python3 _test_alert.py",
+                "--quiet"], timeout=120)
+            ok = ok2; out += out2; err += err2
+            # Clean up the script on the VM
+            run_gcloud([
+                "compute", "ssh", "--zone", zone, VM_NAME,
+                "--command", "rm -f /home/Achilles/_test_alert.py",
+                "--quiet"], timeout=60)
+        # Clean up locally
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
         self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
 
     def do_POST(self):
