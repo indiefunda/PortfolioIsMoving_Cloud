@@ -173,13 +173,17 @@ def find_vm_zone():
     project = get_project()
     if not project:
         return None
-    # Search all candidate zones for the VM.
-    for zone in VM_ZONES:
-        ok, out, _ = run_gcloud(
-            ["compute", "instances", "describe", VM_NAME, "--zone", zone,
-             "--format=value(status)", "--quiet"], timeout=60)
-        if ok and out.strip():
-            return zone
+    # Single fast call: list instances across all zones and find this VM's zone.
+    ok, out, _ = run_gcloud(
+        ["compute", "instances", "list",
+         "--filter=name=" + VM_NAME,
+         "--format=value(zone)", "--quiet"], timeout=60)
+    if ok and out.strip():
+        # zone comes back as a full URL; extract just the zone name.
+        zone = out.strip().splitlines()[0].strip()
+        if "/" in zone:
+            zone = zone.rstrip("/").split("/")[-1]
+        return zone
     return None
 
 
