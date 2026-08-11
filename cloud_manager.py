@@ -323,7 +323,8 @@ HTML = """<!DOCTYPE html>
   <div class="card">
     <h2>5. Usage & health</h2>
     <div class="status" id="usageStatus">—</div>
-    <button class="btn-ghost" onclick="checkUsage()">📊 Check usage so far</button>
+    <button class="btn-ghost" onclick="checkUsage()">� Open my real Google billing page</button>
+    <div class="hint">Opens Google's official billing console in a new tab — the real source of truth for your cost.</div>
     <button class="btn-ghost" onclick="testAlert()">📲 Send test Telegram alert</button>
     <div class="log" id="log">Command output will appear here.</div>
   </div>
@@ -406,11 +407,16 @@ async function setBudget(){
   $('budgetStatus').textContent = d.ok ? 'Budget alert: $1/month' : 'Not set'; }
 
 async function checkUsage(){
-  showMsg('Checking usage...','ok');
+  showMsg('Opening your real Google billing page...','ok');
   const d = await api('/api/usage');
-  $('log').textContent = d.output || '';
-  if(d.ok){ const u=d.usage||{}; $('usageStatus').textContent = u.cost || 'Cost info unavailable.'; }
-  else { $('usageStatus').textContent = d.error||'Could not check.'; } }
+  if(d.ok && d.billing_url){
+    window.open(d.billing_url, '_blank');
+    $('usageStatus').textContent = 'Opened your real Google Cloud billing page in a new tab.';
+    $('log').textContent = d.output || '';
+  } else {
+    $('log').textContent = d.output || '';
+    $('usageStatus').textContent = d.error || 'Could not open billing page.';
+  } }
 
 async function testAlert(){
   showMsg('Sending test alert...','ok');
@@ -606,10 +612,15 @@ class Handler(BaseHTTPRequestHandler):
         # the new Cost Management API. We report honestly instead of faking it.
         note = (f"Billing is {'ENABLED' if billing_enabled else 'NOT enabled'}. "
                 f"Budget alert: {budget_status}. "
-                f"Your VM is the free e2-micro tier = $0/month. "
-                f"Real dollar cost needs BigQuery Billing Export (see GUIDE-CLOUD.md).")
-        self._send_json({"ok": ok, "error": err or ("" if ok else out),
-                         "output": out + err, "usage": {"cost": note}})
+                f"Your VM is the free e2-micro tier = $0/month.")
+        # The real source of truth is Google's own billing console. Build the
+        # URL to that page so the panel can open it.
+        billing_url = None
+        if acct:
+            billing_url = f"https://console.cloud.google.com/billing/{acct}"
+        self._send_json({"ok": True, "error": "",
+                         "output": note,
+                         "billing_url": billing_url})
 
     def _handle_test_alert(self):
         secrets = load_secrets()
