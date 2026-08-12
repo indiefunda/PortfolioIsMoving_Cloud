@@ -7,11 +7,16 @@ REM  http://localhost:8000 in your browser automatically.
 REM ============================================================
 cd /d "%~dp0"
 
-REM Use python from PATH, or common locations
+REM Use python from PATH, the py launcher, or common locations.
+REM %LOCALAPPDATA% is expanded at runtime so this works for any user.
 set "PY=python"
 where python >nul 2>nul
 if errorlevel 1 (
-  if exist "C:\Users\Achilles\AppData\Local\Python\bin\python.exe" set "PY=C:\Users\Achilles\AppData\Local\Python\bin\python.exe"
+  where py >nul 2>nul
+  if not errorlevel 1 set "PY=py"
+)
+if not exist "%PY%" (
+  if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe" set "PY=%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe"
   if exist "C:\Python\python.exe" set "PY=C:\Python\python.exe"
 )
 

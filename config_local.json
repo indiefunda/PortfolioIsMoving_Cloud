@@ -8,6 +8,7 @@
     "LU"
   ],
   "threshold_pct": 5.0,
+  "retrigger_step_pct": 3.0,
   "enabled": true,
   "provider": "finnhub"
 }

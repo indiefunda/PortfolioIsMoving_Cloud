@@ -22,8 +22,8 @@ import json
 import os
 import sys
 from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
-import pytz
 import requests
 
 # ---------------------------------------------------------------------------
@@ -44,8 +44,10 @@ RUN_HISTORY_LIMIT = 500
 # See https://cloud.google.com/free/docs/free-cloud-features
 FREE_EGRESS_MONTHLY_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
 
-# US Eastern timezone (NY market)
-EASTERN = pytz.timezone("US/Eastern")
+# US Eastern timezone (NY market). Using the standard library's zoneinfo means
+# monitor.py has NO third-party timezone dependency, so it imports cleanly even
+# under cron's minimal environment (cron historically failed to import pytz).
+EASTERN = ZoneInfo("America/New_York")
 
 # Telegram API
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
@@ -95,7 +97,7 @@ def load_secrets():
 
 
 def load_state():
-    return _read_json(STATE_FILE, {"date": "", "alerted": [], "daily_usage": {}})
+    return _read_json(STATE_FILE, {"date": "", "alert_levels": {}, "daily_usage": {}})
 
 
 def save_state(state):
@@ -368,13 +370,16 @@ def send_telegram(token, chat_id, message):
         return False
 
 
-def format_alert(symbol, current, prev_close, pct, threshold):
+def format_alert(symbol, current, prev_close, pct, threshold, retrigger_step=3.0):
     direction = "🚨 UP" if pct > 0 else "📉 DOWN"
     arrow = "▲" if pct > 0 else "▼"
+    # Next re-trigger level: same direction, step further out.
+    next_level = (abs(pct) + retrigger_step) * (1 if pct > 0 else -1)
     return (
         f"{direction} {symbol}\n"
         f"{arrow} {abs(pct):.1f}%  (threshold {threshold}%)\n"
-        f"Price: ${current:.2f}  |  Prev close: ${prev_close:.2f}"
+        f"Price: ${current:.2f}  |  Prev close: ${prev_close:.2f}\n"
+        f"Next alert if it reaches {next_level:+.1f}%"
     )
 
 
@@ -419,6 +424,10 @@ def main():
 
     tickers = config.get("tickers", [])
     threshold = float(config.get("threshold_pct", 5.0))
+    # The re-trigger step: once a stock alerts, it only alerts again when the
+    # move intensifies by at least this many percentage points in the SAME
+    # direction (e.g. 5% -> then 8% -> then 11% for a step of 3).
+    retrigger_step = float(config.get("retrigger_step_pct", 3.0))
     provider = config.get("provider", DEFAULT_PROVIDER)
     record["provider"] = provider
     secrets = load_secrets()
@@ -449,7 +458,9 @@ def main():
     state = load_state()
     today = now_et.strftime("%Y-%m-%d")
     if state.get("date") != today:
-        state = {"date": today, "alerted": [], "daily_usage": {}}
+        # New day: reset the per-stock alert levels to 0 so each stock can
+        # trigger fresh again today.
+        state = {"date": today, "alert_levels": {}, "daily_usage": {}}
 
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} ticker(s) "
           f"via {provider}...")
@@ -489,12 +500,29 @@ def main():
         pct = (current - prev_close) / prev_close * 100
         print(f"  - {symbol}: ${current:.2f} (prev ${prev_close:.2f}) = {pct:+.2f}%")
 
+        # --- Direction-aware, step-based alerting (per stock, per day) ---
+        # Each stock remembers the % move that last triggered an alert today.
+        # It alerts again ONLY when the move intensifies by >= retrigger_step
+        # percentage points in the SAME direction. Opposite-direction moves or
+        # smaller fluctuations never re-trigger.
         alerted = False
-        if abs(pct) >= threshold and symbol not in state.get("alerted", []):
-            msg = format_alert(symbol, current, prev_close, pct, threshold)
+        alert_levels = state.setdefault("alert_levels", {})
+        last_level = alert_levels.get(symbol)
+
+        if last_level is None:
+            # First alert of the day: fire when it crosses the threshold.
+            should_alert = abs(pct) >= threshold
+        else:
+            # Same direction AND intensified by at least the step amount.
+            same_direction = (pct > 0) == (last_level > 0)
+            intensified = abs(pct) >= abs(last_level) + retrigger_step
+            should_alert = same_direction and intensified
+
+        if should_alert:
+            msg = format_alert(symbol, current, prev_close, pct, threshold, retrigger_step)
             if send_telegram(token, chat_id, msg):
-                print(f"  -> Alert sent for {symbol}")
-                state.setdefault("alerted", []).append(symbol)
+                print(f"  -> Alert sent for {symbol} at {pct:+.2f}%")
+                alert_levels[symbol] = pct  # remember this level for re-triggers
                 record["alerts_sent"].append(symbol)
                 alerted = True
             else:

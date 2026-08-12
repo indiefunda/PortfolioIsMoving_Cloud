@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -52,6 +53,7 @@ VM_ZONES = [
 DEFAULT_CONFIG = {
     "tickers": [],
     "threshold_pct": 5.0,
+    "retrigger_step_pct": 3.0,
     "enabled": True,
     "provider": "finnhub",
 }
@@ -99,10 +101,12 @@ def save_secrets(sec): _write_json(SECRETS_FILE, sec)
 # gcloud helpers
 # ---------------------------------------------------------------------------
 # Known gcloud install locations (Windows), used if gcloud isn't on PATH.
+# $USERPROFILE and $LOCALAPPDATA are expanded at runtime so this works for
+# any user, not just the original author.
 GCLOUD_CANDIDATES = [
     "gcloud",
-    r"C:\Users\Achilles\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
-    r"C:\Users\Achilles\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud",
+    r"$USERPROFILE\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"$USERPROFILE\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud",
     r"C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
     r"$LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
 ]
@@ -114,11 +118,14 @@ def _find_gcloud():
     found = shutil.which("gcloud")
     if found:
         return found
-    # 2. Known install locations
+    # 2. Known install locations (expand env-var placeholders)
     localappdata = os.environ.get("LOCALAPPDATA", "")
+    userprofile = os.environ.get("USERPROFILE", "")
     for cand in GCLOUD_CANDIDATES:
         if cand.startswith("$LOCALAPPDATA") and localappdata:
             cand = cand.replace("$LOCALAPPDATA", localappdata)
+        if cand.startswith("$USERPROFILE") and userprofile:
+            cand = cand.replace("$USERPROFILE", userprofile)
         if cand and os.path.exists(cand):
             return cand
     return None
@@ -200,6 +207,24 @@ def vm_status():
     return None
 
 
+def get_vm_home(zone):
+    """
+    Return the home directory of the SSH user on the VM (e.g. /home/<user>).
+    This is resolved dynamically so the app works for any Google account /
+    VM, not just the original author's. Falls back to /home/<current OS user>
+    if the SSH command fails.
+    """
+    ok, home, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "echo $HOME", "--quiet"], timeout=60)
+    if ok and home.strip():
+        return home.strip()
+    # Fallback: use the local OS username (matches the default SSH username
+    # gcloud uses for the VM's owner).
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return f"/home/{user}"
+
+
 def fetch_vm_run_history():
     """
     Read the monitor's run_history.json from the VM. Returns a list of run
@@ -208,11 +233,7 @@ def fetch_vm_run_history():
     zone = find_vm_zone()
     if not zone:
         return []
-    # Resolve the VM's actual home directory so we read the right file.
-    ok_home, home, _ = run_gcloud([
-        "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "echo $HOME", "--quiet"], timeout=60)
-    home = home.strip() if ok_home and home.strip() else "/home/Achilles"
+    home = get_vm_home(zone)
     ok, out, err = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
         "--command", f"cat {home}/run_history.json 2>/dev/null || echo '[]'",
@@ -234,10 +255,7 @@ def fetch_vm_network_usage():
     zone = find_vm_zone()
     if not zone:
         return {}
-    ok_home, home, _ = run_gcloud([
-        "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "echo $HOME", "--quiet"], timeout=60)
-    home = home.strip() if ok_home and home.strip() else "/home/Achilles"
+    home = get_vm_home(zone)
     ok, out, err = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
         "--command", f"cat {home}/network_usage.json 2>/dev/null || echo '{{}}'",
@@ -253,45 +271,123 @@ def fetch_vm_network_usage():
 
 def fetch_vm_timer_status():
     """
-    Check whether the monitor's systemd timer is installed, active, and when it
-    next fires (reported in UTC). Returns a dict, or None if the VM isn't
-    reachable.
+    Check the monitor's cron setup on the VM: whether the cron daemon is
+    running, whether the cron job is installed, and when it next fires (UTC).
+    Returns a dict, or None if the VM isn't reachable.
     """
     zone = find_vm_zone()
     if not zone:
         return None
-    # is-active tells us if the timer is armed and running.
-    ok_active, active, _ = run_gcloud([
+    # Is the cron daemon running and enabled at boot?
+    ok_active, active_out, _ = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "systemctl is-active portfolioismoving.timer 2>/dev/null || echo 'inactive'",
+        "--command", "systemctl is-active cron 2>/dev/null || echo 'inactive'",
         "--quiet"], timeout=60)
-    active = active.strip() if ok_active and active.strip() else "unknown"
+    cron_active = (active_out.strip() if ok_active else "unknown")
+    ok_enabled, enabled_out, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "systemctl is-enabled cron 2>/dev/null || echo 'disabled'",
+        "--quiet"], timeout=60)
+    cron_enabled = (enabled_out.strip() if ok_enabled else "unknown")
 
-    # Get the next elapse time as a Unix epoch (microseconds) and format it in
-    # UTC. Using systemctl show avoids fragile parsing of list-timers output.
-    ok_micro, micro_out, _ = run_gcloud([
+    # Is the cron job installed?
+    ok, out, _ = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "systemctl show portfolioismoving.timer -p NextElapseUSec --value 2>/dev/null || true",
+        "--command", "crontab -l 2>/dev/null | grep 'portfolioismoving' || true",
         "--quiet"], timeout=60)
-    next_fire_utc = None
-    if ok_micro and micro_out.strip():
-        micro = micro_out.strip()
-        try:
-            # systemctl show returns a unix timestamp in microseconds.
-            seconds = int(micro) / 1_000_000
-            ok_dt, dt_out, _ = run_gcloud([
-                "compute", "ssh", "--zone", zone, VM_NAME,
-                "--command", f"date -u -d @{int(seconds)} '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true",
-                "--quiet"], timeout=60)
-            if ok_dt and dt_out.strip():
-                next_fire_utc = dt_out.strip()
-        except (ValueError, TypeError):
-            next_fire_utc = None
+    cron_line = out.strip() if ok else ""
+    installed = bool(cron_line)
+
+    # When did the monitor last run? (from run_history.json, newest first)
+    last_run = None
+    history = fetch_vm_run_history()
+    if history and isinstance(history, list) and history:
+        last_run = history[0].get("timestamp")
 
     return {
-        "active": active.strip(),
-        "next_fire_utc": next_fire_utc,
+        "active": "active" if installed else "inactive",
+        "cron_daemon_active": cron_active,
+        "cron_daemon_enabled": cron_enabled,
+        "cron_line": cron_line,
+        "next_fire_utc": compute_next_cron_utc(cron_line) if installed else None,
+        "last_run": last_run,
     }
+
+
+def _expand_cron_field(field, low, high):
+    """
+    Expand a single cron field (e.g. "*", "*/10", "13-21", "1,5") into a set
+    of allowed integer values in [low, high].
+    """
+    result = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            part, _, step_str = part.partition("/")
+            try:
+                step = int(step_str)
+            except ValueError:
+                step = 1
+        if part == "*":
+            base = range(low, high + 1)
+        elif "-" in part:
+            try:
+                a, b = part.split("-")
+                base = range(int(a), int(b) + 1)
+            except ValueError:
+                base = []
+        else:
+            try:
+                base = [int(part)]
+            except ValueError:
+                base = []
+        for v in base:
+            if low <= v <= high and (v - low) % step == 0:
+                result.add(v)
+    return result
+
+
+def compute_next_cron_utc(cron_line, now=None):
+    """
+    Compute the next time a cron line will fire, in UTC. Takes the first 5
+    fields of the cron line (minute hour dom month dow) and returns a string
+    like "2026-08-12 13:10:00 UTC", or None if it can't be determined.
+    """
+    parts = (cron_line or "").split()
+    if len(parts) < 5:
+        return None
+    min_field, hour_field, dom_field, mon_field, dow_field = parts[:5]
+    try:
+        minutes = _expand_cron_field(min_field, 0, 59)
+        hours = _expand_cron_field(hour_field, 0, 23)
+        months = _expand_cron_field(mon_field, 1, 12)
+        dows = _expand_cron_field(dow_field, 0, 6)  # cron: 0=Sun..6=Sat
+        # day-of-month: only handle '*' (all days) simply; anything else we
+        # treat as all days to avoid over-engineering.
+    except Exception:
+        return None
+    if not minutes or not hours or not months or not dows:
+        return None
+    now = now or datetime.utcnow()
+    for day_offset in range(0, 366):
+        d = now + timedelta(days=day_offset)
+        if d.month not in months:
+            continue
+        py_dow = d.weekday()          # Mon=0..Sun=6
+        cron_dow = (py_dow + 1) % 7  # Sun=0..Sat=6
+        if cron_dow not in dows:
+            continue
+        for h in sorted(hours):
+            if day_offset == 0 and h < now.hour:
+                continue
+            for m in sorted(minutes):
+                candidate = d.replace(hour=h, minute=m, second=0, microsecond=0)
+                if candidate > now:
+                    return candidate.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +497,9 @@ HTML = """<!DOCTYPE html>
     </div>
     <label>Alert threshold (%)</label>
     <input id="threshold" type="number" step="0.5" min="0.1">
+    <label>Re-trigger step (%)</label>
+    <input id="retriggerStep" type="number" step="0.5" min="0.1">
+    <div class="hint">Once a stock alerts, it alerts again only when the move intensifies by this many % in the same direction (resets daily). Example: threshold 5% + step 3% → alerts at 5%, then 8%, then 11%.</div>
     <label>Provider</label>
     <select id="provider" onchange="updateProviderUI()">
       <option value="finnhub">Finnhub — real-time</option>
@@ -450,7 +549,8 @@ HTML = """<!DOCTYPE html>
     <h2>6. What the monitor saw (run history)</h2>
     <div class="status" id="timerStatus">—</div>
     <button class="btn-ghost" onclick="loadTimer()">↻ Check schedule</button>
-    <div class="hint">The monitor is triggered by a systemd timer on the server every 10 min, Mon–Fri. This shows whether that schedule is armed and when it next fires.</div>
+    <button class="btn-ok" onclick="runNow()">▶ Run now (test)</button>
+    <div class="hint">The monitor is triggered by a cron job on the server every 10 min, Mon–Fri. This shows whether that schedule is installed and when it next fires (UTC).</div>
     <div class="status" id="logStatus">—</div>
     <button class="btn-ghost" onclick="loadLogs()">↻ Refresh run history</button>
     <div class="hint">Shows every run from the cloud server: when it ran, how long it took, what prices it saw (even when no alert was sent), and whether alerts went out. The newest run is on top.</div>
@@ -483,6 +583,7 @@ async function load(){
   const d = await api('/api/config');
   tickers = d.config.tickers || [];
   $('threshold').value = d.config.threshold_pct;
+  $('retriggerStep').value = d.config.retrigger_step_pct || 3.0;
   $('provider').value = d.config.provider || 'finnhub';
   $('enabledToggle').checked = !!d.config.enabled;
   const p = d.config.provider || 'finnhub';
@@ -523,6 +624,7 @@ async function createVM(){
 async function uploadConfig(){
   const d = await api('/api/upload', {
     tickers, threshold_pct: parseFloat($('threshold').value)||5.0,
+    retrigger_step_pct: parseFloat($('retriggerStep').value)||3.0,
     enabled: $('enabledToggle').checked, provider: $('provider').value,
     finnhub_key: $('apikey').value.trim(), twelvedata_key: null,
     telegram_bot_token: $('token').value.trim(), telegram_chat_id: $('chatid').value.trim(),
@@ -581,11 +683,35 @@ async function loadTimer(){
     return;
   }
   const active = String(t.active || '').trim();
-  if(active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed.</b> Next run (UTC): '+(t.next_fire_utc || 'unknown');
+  const daemon = String(t.cron_daemon_active || 'unknown').trim();
+  const enabled = String(t.cron_daemon_enabled || 'unknown').trim();
+
+  // Show the cron daemon health first - if cron isn't running, nothing fires.
+  let daemonHtml;
+  if(daemon === 'active'){
+    daemonHtml = 'cron daemon: <span class="badge ok">running</span> · boot: <span class="badge '+(enabled==='enabled'?'ok':'warn')+'">'+(enabled==='enabled'?'enabled':'not enabled')+'</span>';
   } else {
-    el.innerHTML = '<span class="dot red"></span><b>Schedule is NOT running.</b> The server says the timer is "'+active+'". Re-upload your config (Step 3) to re-install the schedule.';
+    daemonHtml = 'cron daemon: <span class="badge err">NOT running ('+daemon+')</span> · boot: '+(enabled==='enabled'?'enabled':'not enabled');
   }
+
+  if(active === 'active'){
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (cron).</b> Next run (UTC): '+(t.next_fire_utc || 'unknown')+
+      (t.last_run ? '<br>Last run: '+escapeHtml(t.last_run) : '')+
+      '<br>'+daemonHtml+
+      (t.cron_line ? '<br><span style="color:var(--muted)">'+escapeHtml(t.cron_line)+'</span>' : '');
+  } else {
+    el.innerHTML = '<span class="dot red"></span><b>Schedule is NOT installed.</b> Re-upload your config (Step 3) to install it.<br>'+daemonHtml;
+  }
+}
+
+async function runNow(){
+  showMsg('Running monitor.py on the server now...','ok');
+  const d = await api('/api/run_now');
+  $('log').textContent = d.output || '';
+  showMsg(d.ok ? '✅ Monitor ran successfully on the server.' : '❌ '+d.error, d.ok?'ok':'err');
+  // Refresh the schedule + run history so the new run shows up.
+  loadTimer();
+  loadLogs();
 }
 
 function formatBytes(n){
@@ -734,6 +860,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_usage()
         elif parsed.path == "/api/test_alert":
             self._handle_test_alert()
+        elif parsed.path == "/api/run_now":
+            self._handle_run_now()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -786,10 +914,7 @@ class Handler(BaseHTTPRequestHandler):
         if not zone:
             return False, "", "VM not found."
         # Resolve the VM's home directory (pscp can't use ~/ as a target).
-        ok, home, _ = run_gcloud([
-            "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", "echo $HOME", "--quiet"], timeout=60)
-        home = home.strip() if ok and home.strip() else "/home/Achilles"
+        home = get_vm_home(zone)
         out, err = "", ""
         # scp the needed files to the absolute home path
         files = ["monitor.py", "requirements.txt", "setup_cloud.sh",
@@ -904,21 +1029,22 @@ class Handler(BaseHTTPRequestHandler):
         script_path = os.path.join(BASE_DIR, "_test_alert.py")
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(script)
+        home = get_vm_home(zone)
         # Upload the script
         ok, out, err = run_gcloud([
             "compute", "scp", "--zone", zone, script_path,
-            f"{VM_NAME}:/home/Achilles/", "--quiet"], timeout=120)
+            f"{VM_NAME}:{home}/", "--quiet"], timeout=120)
         # Run it
         if ok:
             ok2, out2, err2 = run_gcloud([
                 "compute", "ssh", "--zone", zone, VM_NAME,
-                "--command", "cd /home/Achilles && python3 _test_alert.py",
+                "--command", f"cd {home} && python3 _test_alert.py",
                 "--quiet"], timeout=120)
             ok = ok2; out += out2; err += err2
             # Clean up the script on the VM
             run_gcloud([
                 "compute", "ssh", "--zone", zone, VM_NAME,
-                "--command", "rm -f /home/Achilles/_test_alert.py",
+                "--command", f"rm -f {home}/_test_alert.py",
                 "--quiet"], timeout=60)
         # Clean up locally
         try:
@@ -926,6 +1052,26 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
+
+    def _handle_run_now(self):
+        """
+        Run monitor.py once on the VM right now and return its output. This is
+        a real end-to-end test: it proves the monitor itself works, so if the
+        scheduled cron runs don't appear afterwards, the problem is the
+        scheduler, not the monitor.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 monitor.py 2>&1",
+            "--quiet"], timeout=120)
+        # The monitor writes a run_history record; refresh happens on next load.
+        self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                         "output": out + err})
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -935,6 +1081,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_config(); secrets = load_secrets()
             cfg["tickers"] = [t.strip().upper() for t in data.get("tickers", []) if t.strip()]
             cfg["threshold_pct"] = float(data.get("threshold_pct", 5.0))
+            cfg["retrigger_step_pct"] = float(data.get("retrigger_step_pct", 3.0))
             cfg["enabled"] = bool(data.get("enabled", True))
             cfg["provider"] = data.get("provider", "finnhub")
             provider = cfg["provider"]

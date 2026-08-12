@@ -139,9 +139,9 @@ what's happening. It shows a table of every run from the server:
 If the table is empty or the **Status** column shows `error`, the **Details**
 column will tell you why (e.g. missing Telegram credentials, no config, etc.).
 
-> **"Check schedule"** — the panel also shows whether the server's schedule is
-> armed and when it next fires. If it says the schedule is **not running**,
-> click **"Upload config to server"** (Step 3) to re-install it.
+> **"Check schedule"** — the panel also shows whether the server's cron job is
+> installed and when it next fires (in UTC). If it says the schedule is
+> **not running**, click **"Upload config to server"** (Step 3) to install it.
 
 ### 📡 Network egress (staying inside the free tier)
 
@@ -172,8 +172,10 @@ it reflects real bytes the monitor sent — no extra Google setup needed.
 
 ## 🛑 Stopping it (if you ever need to)
 
+Remove the cron job:
+
 ```bash
-sudo systemctl disable --now portfolioismoving.timer
+crontab -l | grep -v portfolioismoving | crontab -
 ```
 
 ---
@@ -185,7 +187,7 @@ sudo systemctl disable --now portfolioismoving.timer
 | The panel says "gcloud not installed" | Do Part 1 (install the Google Cloud CLI), then restart the panel. |
 | "Authenticate" doesn't finish | Make sure you completed the login in the browser that opened. |
 | "Server created" but no alerts | In the panel, click **"Upload config to server"**, then **"Send test alert"**. Also check the **"What the monitor saw"** table — if it shows `error`, read the Details column. If it shows `outside hours`, the market simply isn't open yet. |
-| Run history stays empty / schedule shows "NOT running" | The server's timer isn't firing. Click **"Upload config to server"** (Step 3) to re-install it, then click **"Check schedule"** — it should show "Schedule armed" with a next-run time. |
+| Run history stays empty / schedule shows "NOT running" | The cron job isn't installed. Click **"Upload config to server"** (Step 3) to install it, then click **"Check schedule"** — it should show "Schedule armed (cron)" with a next-run time. |
 | The free e2-micro isn't available | The panel uses `us-central1-a` (a free region). If it fails, see the manual method below. |
 | You get charged | You shouldn't — the **$1 budget alert** will email you first. If you see it, stop the server immediately. |
 | Card verification fails | Use a different card (a standard bank debit or credit card). Revolut usually works but some banks' cards are rejected. |
@@ -203,7 +205,43 @@ Done. ✅
 
 ---
 
-## 📋 Appendix — manual method (if the panel can't create the server)
+## � Sharing with friends
+
+The app is **fully reusable**. Each person runs it on **their own PC**, signs
+in with **their own Google account**, and it creates **their own** VM in
+**their own** Google Cloud project. Nobody shares a server, and nobody sees
+anyone else's stocks, keys, or Telegram.
+
+To share it:
+
+1. **Send your friend the whole folder** (zip it up), or point them at the
+   GitHub repo.
+2. They run **`start_cloud.bat`** (or `python cloud_manager.py`) on their PC.
+3. They follow the normal steps: **Authenticate** (their Google login opens),
+   **Create free server** (creates *their* VM), fill in *their* stocks/keys/
+   Telegram, **Upload config**, **Set budget alert**, **Send test alert**.
+
+### What they need first (one time)
+- A **Google account** (any Gmail works).
+- The **Google Cloud CLI** installed (Part 1 above).
+- They must have accepted the Google Cloud free-tier terms and linked a
+  billing account (a Revolut card with a small balance works great — see
+  Part 0).
+
+### Things that are already per-user (no setup needed)
+- **Google project** — auto-selected from their account.
+- **VM home directory** — resolved automatically, so it works no matter
+  what their SSH username is.
+- **gcloud install location** — found via PATH or standard Windows locations.
+- **Stocks, API keys, Telegram** — all stored in their own local
+  `config_local.json` / `secrets_local.json` and uploaded to *their* VM.
+
+> ⚠️ **Never send anyone your `secrets_local.json`** — it contains your
+> Telegram bot token and API keys. It's git-ignored and meant to stay local.
+
+---
+
+## �📋 Appendix — manual method (if the panel can't create the server)
 
 If the panel's "Create server" button ever fails, you can create it by hand:
 

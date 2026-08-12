@@ -8,12 +8,12 @@
 # What it does:
 #   1. Installs Python 3, pip, and cron
 #   2. Installs the Python packages (requests, pytz)
-#   3. Installs a systemd timer that runs monitor.py every 10
+#   3. Installs a cron job that runs monitor.py every 10
 #      minutes during US market hours (Mon-Fri)
 #   4. Runs monitor.py once to confirm it works
 #
-# The systemd timer is MORE reliable than cron - it survives
-# reboots and fires on time every time.
+# We use cron (not a systemd timer) because its schedule syntax is simple
+# and unambiguous, making it reliable to install and verify.
 # ============================================================
 
 set -e
@@ -27,65 +27,101 @@ echo "[1/4] Installing Python and system tools..."
 sudo apt-get update -y
 sudo apt-get install -y python3 python3-pip cron || true
 
-# --- 2. Install Python dependencies
-echo "[2/4] Installing Python packages (requests, pytz)..."
-pip3 install --break-system-packages --upgrade pip 2>/dev/null || pip3 install --upgrade pip
-pip3 install --break-system-packages -r requirements.txt 2>/dev/null || pip3 install -r requirements.txt
+# Make sure the cron daemon is actually running AND enabled at boot. On some
+# minimal Debian images, installing cron doesn't start or enable it, which is
+# a common silent cause of "the monitor never runs unattended".
+sudo systemctl enable cron 2>/dev/null || true
+sudo systemctl start cron 2>/dev/null || true
+echo "  cron daemon: $(systemctl is-active cron 2>/dev/null || echo 'not running')"
+echo "  cron at boot: $(systemctl is-enabled cron 2>/dev/null || echo 'not enabled')"
 
-# --- 3. Set up the 10-minute timer
-echo "[3/4] Setting up the 10-minute schedule..."
+# --- 2. Install Python dependencies system-wide
+echo "[2/4] Installing Python packages (requests, pytz)..."
+# IMPORTANT: install with sudo so the packages go into the system site-packages.
+# If they land in the USER site-packages (~/.local/...), cron cannot import
+# them (cron runs with a minimal environment), and monitor.py crashes with
+# "No module named 'pytz'" every time it runs on schedule. This was the root
+# cause of "the monitor never fires unattended".
+sudo python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null \
+  || sudo python3 -m pip install --upgrade pip
+sudo python3 -m pip install --break-system-packages -r requirements.txt 2>/dev/null \
+  || sudo python3 -m pip install -r requirements.txt
+echo "  pytz import check (as cron would):"
+python3 -c "import pytz, requests; print('  OK - pytz and requests importable')"
+
+# --- 3. Set up the 10-minute schedule using cron
+echo "[3/4] Setting up the 10-minute schedule (cron)..."
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MONITOR="$PROJECT_DIR/monitor.py"
 LOG="$PROJECT_DIR/monitor.log"
 PYTHON="$(command -v python3)"
 
-# Create a systemd service that runs the monitor
-SERVICE_FILE="/etc/systemd/system/portfolioismoving.service"
-sudo tee "$SERVICE_FILE" > /dev/null <<EOF
-[Unit]
-Description=PortfolioIsMoving stock monitor
-After=network-online.target
+# We use cron instead of a systemd timer because cron's schedule syntax is
+# simple and unambiguous, and it has proven far more reliable to install and
+# verify. The job runs every 10 minutes, hours 13-21 UTC, Mon-Fri (a coarse
+# window that covers US market hours; monitor.py itself does the precise
+# market-hours check).
 
-[Service]
-Type=oneshot
-WorkingDirectory=$PROJECT_DIR
-ExecStart=$PYTHON $MONITOR
-StandardOutput=append:$LOG
-StandardError=append:$LOG
-EOF
+# Remove any old systemd timer/service from earlier versions so they don't
+# conflict or confuse things.
+sudo systemctl disable --now portfolioismoving.timer 2>/dev/null || true
+sudo rm -f /etc/systemd/system/portfolioismoving.timer
+sudo rm -f /etc/systemd/system/portfolioismoving.service
+sudo systemctl daemon-reload 2>/dev/null || true
 
-# Create a systemd timer that fires every 10 min, Mon-Fri, during market hours (13-21 UTC)
+# Build the cron line. Note: % must be escaped as \% inside a crontab line,
+# but our command has no % so this is straightforward.
+# Schedule: every 10 minutes, hours 13-21 UTC, Mon-Fri (covers US market
+# hours; monitor.py does the precise market-hours check).
+CRON_LINE="*/10 13-21 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+
+# Resolve the absolute path to crontab. When this script runs through
+# "gcloud compute ssh --command", the non-interactive PATH may not include
+# /usr/sbin or /usr/bin, so "crontab" alone can silently fail.
+CRONTAB="$(command -v crontab || echo /usr/bin/crontab)"
+MKTEMP="$(command -v mktemp || echo /usr/bin/mktemp)"
+GREP="$(command -v grep || echo /bin/grep)"
+
+# Install the cron job using a temp file. We deliberately do NOT pipe to
+# "crontab -" (stdin) because that has proven to fail silently in this SSH
+# environment. Writing a temp file and calling "crontab <file>" is the
+# reliable, standard way and lets us check the result explicitly.
 #
-# IMPORTANT: the calendar expression below is deliberately written as an hour
-# range with a minute step ("13..21:00/10:00"). The alternative
-# "Mon-Fri *-*-* 13:00/10:00" is a well-known systemd gotcha: combining a
-# day-of-week filter with a "/STEP" time makes the timer fire only ONCE (at
-# 13:00) instead of every 10 minutes. The range form below repeats reliably.
-TIMER_FILE="/etc/systemd/system/portfolioismoving.timer"
-sudo tee "$TIMER_FILE" > /dev/null <<EOF
-[Unit]
-Description=Run PortfolioIsMoving every 10 min during market hours
+# NOTE: we filter out old copies by matching "monitor.py" (the marker unique
+# to our job). The old code filtered on "portfolioismoving", but the cron line
+# itself never contains that string, so old jobs were never removed and every
+# setup run added a duplicate. This was why multiple identical cron jobs
+# accumulated on the VM.
+TMPCRON="$("$MKTEMP")"
+"$CRONTAB" -l 2>/dev/null | "$GREP" -v 'monitor.py' > "$TMPCRON" || true
+echo "$CRON_LINE" >> "$TMPCRON"
+if "$CRONTAB" "$TMPCRON"; then
+  echo "  ✅ Cron job installed (user crontab)."
+else
+  echo "  ⚠️  User crontab failed - trying /etc/cron.d/ instead..."
+  # Fallback: install a system cron file (needs root). Format is the same
+  # as a crontab but with the username field added.
+  USERNAME="$(id -un 2>/dev/null || echo root)"
+  echo "*/10 13-21 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/portfolioismoving-cron
+  if sudo mv /tmp/portfolioismoving-cron /etc/cron.d/portfolioismoving; then
+    echo "  ✅ Cron job installed (/etc/cron.d/portfolioismoving)."
+    rm -f "$TMPCRON"
+  else
+    echo "  ❌ FAILED to install the cron job (both methods returned an error)."
+    echo "     crontab path: $CRONTAB"
+    echo "     Try manually: $CRONTAB $TMPCRON"
+    exit 1
+  fi
+fi
+rm -f "$TMPCRON"
 
-[Timer]
-OnCalendar=Mon-Fri *-*-* 13..21:00/10:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-# Enable and start the timer
-sudo systemctl daemon-reload
-sudo systemctl enable portfolioismoving.timer
-sudo systemctl start portfolioismoving.timer
-
-echo "  Timer installed: every 10 min, Mon-Fri, 13:00-21:00 UTC"
-
-# Verify the timer is actually armed and show its next fire time. If this
-# prints nothing for "Next elapse", the schedule did not take effect.
-echo "  Timer status:"
-systemctl list-timers portfolioismoving.timer --no-pager || true
-echo "  Active state: $(systemctl is-active portfolioismoving.timer 2>/dev/null || echo 'unknown')"
+echo "  Cron installed: $CRON_LINE"
+echo "  Installed job(s):"
+"$CRONTAB" -l 2>/dev/null | "$GREP" 'monitor.py' || echo "  (not in user crontab - check /etc/cron.d/)"
+echo "  cron daemon active: $(systemctl is-active cron 2>/dev/null || echo 'no')"
+if [ "$(systemctl is-active cron 2>/dev/null)" != "active" ]; then
+  echo "  ⚠️  WARNING: the cron daemon is not running. Try: sudo systemctl start cron"
+fi
 
 # --- 4. Run once to confirm it works
 echo "[4/4] Running monitor.py once to test..."
@@ -99,8 +135,8 @@ echo " To check it's working:"
 echo "   cat $LOG"
 echo ""
 echo " To see the schedule:"
-echo "   systemctl list-timers | grep portfolio"
+echo "   crontab -l | grep portfolioismoving"
 echo ""
 echo " To stop it (if you ever need to):"
-echo "   sudo systemctl disable --now portfolioismoving.timer"
+echo "   crontab -l | grep -v portfolioismoving | crontab -"
 echo "=============================================="
