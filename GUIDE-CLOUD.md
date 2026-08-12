@@ -131,17 +131,42 @@ what's happening. It shows a table of every run from the server:
 - **Duration** — how long the run took
 - **Provider** — which price source was used
 - **Checked** — how many tickers it looked at
+- **Egress** — how many bytes this run sent out (see "Network egress" below)
 - **Alerts** — how many alerts were sent / failed
-- **Details** — expandable list of the prices it saw, even when nothing
-  crossed your threshold
+- **Details** — expandable list of the prices it saw (with the bytes each
+  single API call used), even when nothing crossed your threshold
 
 If the table is empty or the **Status** column shows `error`, the **Details**
 column will tell you why (e.g. missing Telegram credentials, no config, etc.).
 
+> **"Check schedule"** — the panel also shows whether the server's schedule is
+> armed and when it next fires. If it says the schedule is **not running**,
+> click **"Upload config to server"** (Step 3) to re-install it.
+
+### 📡 Network egress (staying inside the free tier)
+
+Your free Google Cloud tier includes **1 GB of outbound traffic per month**
+(from North America, where this VM lives). The panel's **"Network egress"**
+block in the "Usage & health" card shows:
+
+- **This month** — total bytes sent so far, compared against the 1 GB free
+  limit, as a percentage (turns red near 80%).
+- **Per day** — a breakdown of each day's usage.
+
+The **Egress** column in the run-history table shows how many bytes each run
+used, and the expandable price list shows the bytes for each individual API
+call. This is measured on the server itself (from the network interface), so
+it reflects real bytes the monitor sent — no extra Google setup needed.
+
+> If you ever switch the VM to a different region, the free egress allowance
+> can differ (some regions offer more). The panel assumes 1 GB/month, the
+> N. America allowance.
+
 > *(Manual check:)* `cat ~/PortfolioIsMoving/monitor.log` on the server shows
 > a new line every 10 minutes during market hours, and
 > `cat ~/PortfolioIsMoving/run_history.json` holds the structured run records
-> the panel displays.
+> the panel displays. `cat ~/PortfolioIsMoving/network_usage.json` holds the
+> monthly + per-day egress tally.
 
 ---
 
@@ -160,6 +185,7 @@ sudo systemctl disable --now portfolioismoving.timer
 | The panel says "gcloud not installed" | Do Part 1 (install the Google Cloud CLI), then restart the panel. |
 | "Authenticate" doesn't finish | Make sure you completed the login in the browser that opened. |
 | "Server created" but no alerts | In the panel, click **"Upload config to server"**, then **"Send test alert"**. Also check the **"What the monitor saw"** table — if it shows `error`, read the Details column. If it shows `outside hours`, the market simply isn't open yet. |
+| Run history stays empty / schedule shows "NOT running" | The server's timer isn't firing. Click **"Upload config to server"** (Step 3) to re-install it, then click **"Check schedule"** — it should show "Schedule armed" with a next-run time. |
 | The free e2-micro isn't available | The panel uses `us-central1-a` (a free region). If it fails, see the manual method below. |
 | You get charged | You shouldn't — the **$1 budget alert** will email you first. If you see it, stop the server immediately. |
 | Card verification fails | Use a different card (a standard bank debit or credit card). Revolut usually works but some banks' cards are rejected. |

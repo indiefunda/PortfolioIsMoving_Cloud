@@ -14,6 +14,7 @@ secrets_local.json
 # Runtime state
 state.json
 run_history.json
+network_usage.json
 
 # OS
 Thumbs.db

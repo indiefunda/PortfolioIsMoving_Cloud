@@ -226,6 +226,74 @@ def fetch_vm_run_history():
         return []
 
 
+def fetch_vm_network_usage():
+    """
+    Read the monitor's cumulative network_usage.json from the VM. Returns a
+    dict with the monthly + per-day egress tally, or {} if not reachable yet.
+    """
+    zone = find_vm_zone()
+    if not zone:
+        return {}
+    ok_home, home, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "echo $HOME", "--quiet"], timeout=60)
+    home = home.strip() if ok_home and home.strip() else "/home/Achilles"
+    ok, out, err = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", f"cat {home}/network_usage.json 2>/dev/null || echo '{{}}'",
+        "--quiet"], timeout=60)
+    if not ok:
+        return {}
+    try:
+        data = json.loads(out)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def fetch_vm_timer_status():
+    """
+    Check whether the monitor's systemd timer is installed, active, and when it
+    next fires (reported in UTC). Returns a dict, or None if the VM isn't
+    reachable.
+    """
+    zone = find_vm_zone()
+    if not zone:
+        return None
+    # is-active tells us if the timer is armed and running.
+    ok_active, active, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "systemctl is-active portfolioismoving.timer 2>/dev/null || echo 'inactive'",
+        "--quiet"], timeout=60)
+    active = active.strip() if ok_active and active.strip() else "unknown"
+
+    # Get the next elapse time as a Unix epoch (microseconds) and format it in
+    # UTC. Using systemctl show avoids fragile parsing of list-timers output.
+    ok_micro, micro_out, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "systemctl show portfolioismoving.timer -p NextElapseUSec --value 2>/dev/null || true",
+        "--quiet"], timeout=60)
+    next_fire_utc = None
+    if ok_micro and micro_out.strip():
+        micro = micro_out.strip()
+        try:
+            # systemctl show returns a unix timestamp in microseconds.
+            seconds = int(micro) / 1_000_000
+            ok_dt, dt_out, _ = run_gcloud([
+                "compute", "ssh", "--zone", zone, VM_NAME,
+                "--command", f"date -u -d @{int(seconds)} '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true",
+                "--quiet"], timeout=60)
+            if ok_dt and dt_out.strip():
+                next_fire_utc = dt_out.strip()
+        except (ValueError, TypeError):
+            next_fire_utc = None
+
+    return {
+        "active": active.strip(),
+        "next_fire_utc": next_fire_utc,
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTML dashboard
 # ---------------------------------------------------------------------------
@@ -371,11 +439,18 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Opens Google's official billing console in a new tab — the real source of truth for your cost.</div>
     <button class="btn-ghost" onclick="testAlert()">📲 Send test Telegram alert</button>
     <div class="log" id="log">Command output will appear here.</div>
+    <label style="margin-top:16px">Network egress (free-tier usage)</label>
+    <div class="status" id="netStatus">—</div>
+    <button class="btn-ghost" onclick="loadNetwork()">↻ Refresh network usage</button>
+    <div class="hint">Your free Google Cloud tier includes 1 GB of outbound traffic per month (from N. America). This is measured on the server, so it reflects real bytes sent by the monitor.</div>
   </div>
 
   <!-- Step 6: Run history -->
   <div class="card">
     <h2>6. What the monitor saw (run history)</h2>
+    <div class="status" id="timerStatus">—</div>
+    <button class="btn-ghost" onclick="loadTimer()">↻ Check schedule</button>
+    <div class="hint">The monitor is triggered by a systemd timer on the server every 10 min, Mon–Fri. This shows whether that schedule is armed and when it next fires.</div>
     <div class="status" id="logStatus">—</div>
     <button class="btn-ghost" onclick="loadLogs()">↻ Refresh run history</button>
     <div class="hint">Shows every run from the cloud server: when it ran, how long it took, what prices it saw (even when no alert was sent), and whether alerts went out. The newest run is on top.</div>
@@ -416,7 +491,9 @@ async function load(){
   $('chatid').value = d.secrets.telegram_chat_id || '';
   renderChips(); updateProviderUI();
   refreshStatus();
+  loadTimer();
   loadLogs();
+  loadNetwork();
 }
 
 async function refreshStatus(){
@@ -494,6 +571,57 @@ async function loadLogs(){
   renderLogs(d.logs || []);
 }
 
+async function loadTimer(){
+  $('timerStatus').textContent = 'Checking the schedule on the server...';
+  const d = await api('/api/timer');
+  const t = d.timer;
+  const el = $('timerStatus');
+  if(!t){
+    el.innerHTML = '<span class="dot gray"></span><b>Could not reach the server.</b> Make sure the VM is running.';
+    return;
+  }
+  const active = String(t.active || '').trim();
+  if(active === 'active'){
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed.</b> Next run (UTC): '+(t.next_fire_utc || 'unknown');
+  } else {
+    el.innerHTML = '<span class="dot red"></span><b>Schedule is NOT running.</b> The server says the timer is "'+active+'". Re-upload your config (Step 3) to re-install the schedule.';
+  }
+}
+
+function formatBytes(n){
+  if(n==null) return '—';
+  const units=['B','KB','MB','GB'];
+  let v=n, i=0;
+  while(v>=1024 && i<units.length-1){ v/=1024; i++; }
+  return (i===0 ? Math.round(v) : v.toFixed(1))+' '+units[i];
+}
+
+async function loadNetwork(){
+  $('netStatus').textContent = 'Fetching network usage from the server...';
+  const d = await api('/api/network');
+  renderNetwork(d.network || {}, d.monthly_limit_bytes);
+}
+
+function renderNetwork(net, limitBytes){
+  const el = $('netStatus');
+  if(!net || !net.monthly_bytes){
+    el.innerHTML = '<span class="dot gray"></span><b>No network data yet.</b> It appears after the next run of the monitor on the server.';
+    return;
+  }
+  const monthly = net.monthly_bytes || 0;
+  const today = net.days ? (net.days[Object.keys(net.days).sort().pop()] || 0) : 0;
+  const pct = limitBytes ? (monthly/limitBytes*100) : 0;
+  const dot = pct >= 80 ? 'red' : (pct >= 50 ? 'gray' : 'green');
+  let html = '<span class="dot '+dot+'"></span><b>This month ('+net.month+'):</b> '+formatBytes(monthly)+
+    ' of '+formatBytes(limitBytes)+' free ('+pct.toFixed(2)+'%)';
+  const dayKeys = net.days ? Object.keys(net.days).sort() : [];
+  if(dayKeys.length){
+    html += '<br>Per day: ';
+    html += dayKeys.map(k=>k+' = '+formatBytes(net.days[k])).join(' &nbsp;·&nbsp; ');
+  }
+  el.innerHTML = html;
+}
+
 function renderLogs(logs){
   const wrap = $('logTableWrap');
   const status = $('logStatus');
@@ -503,8 +631,13 @@ function renderLogs(logs){
     return;
   }
   status.textContent = logs.length + (logs.length===1?' run':' runs') + ' recorded (newest first).';
+  // Show only the 10 most recent runs to keep the table readable.
+  const shown = logs.slice(0, 10);
+  if(logs.length > shown.length){
+    status.textContent += ' Showing the latest '+shown.length+'.';
+  }
   let rows = '';
-  for(const r of logs){
+  for(const r of shown){
     const dur = (r.duration_sec!=null) ? r.duration_sec+'s' : '—';
     const alerts = (r.alerts_sent||[]).length;
     const failed = (r.alerts_failed||[]).length;
@@ -513,25 +646,27 @@ function renderLogs(logs){
     let detail = '';
     if(r.prices && r.prices.length){
       const items = r.prices.map(p=>{
-        if(p.pct==null) return '<li><b>'+p.symbol+'</b>: '+ (p.note||'no data') +'</li>';
+        const egress = (p.egress_bytes!=null) ? ' · '+formatBytes(p.egress_bytes) : '';
+        if(p.pct==null) return '<li><b>'+p.symbol+'</b>: '+ (p.note||'no data') + egress +'</li>';
         const cls = p.pct>0?'pos':(p.pct<0?'neg':'');
         return '<li><b>'+p.symbol+'</b>: $'+p.current+' (prev $'+p.prev_close+') = <span class="'+cls+'">'+
-          (p.pct>0?'+':'')+p.pct+'%</span>'+(p.alert?' <span class="badge ok">ALERT</span>':'')+'</li>';
+          (p.pct>0?'+':'')+p.pct+'%</span>'+(p.alert?' <span class="badge ok">ALERT</span>':'')+egress+'</li>';
       }).join('');
       detail = '<details><summary>Prices seen ('+r.prices.length+')</summary><ul style="margin:6px 0 0;padding-left:18px">'+items+'</ul></details>';
     }
-    rows += '<tr>'+
+    rows += '<tr>'+ 
       '<td>'+escapeHtml(r.timestamp||'—')+'</td>'+
       '<td>'+badgeFor(r.status)+'</td>'+
       '<td class="pct">'+dur+'</td>'+
       '<td>'+escapeHtml(r.provider||'—')+'</td>'+
       '<td class="pct">'+escapeHtml(r.tickers_checked||0)+'</td>'+
+      '<td class="pct">'+formatBytes(r.egress_bytes)+'</td>'+
       '<td>'+alertCell+'</td>'+
       '<td>'+(r.error?escapeHtml(r.error):(detail||'—'))+'</td>'+
       '</tr>';
   }
   wrap.innerHTML = '<div class="tablewrap"><table>'+
-    '<thead><tr><th>Time (ET)</th><th>Status</th><th>Duration</th><th>Provider</th><th>Checked</th><th>Alerts</th><th>Details</th></tr></thead>'+
+    '<thead><tr><th>Time (ET)</th><th>Status</th><th>Duration</th><th>Provider</th><th>Checked</th><th>Egress</th><th>Alerts</th><th>Details</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
 
@@ -582,6 +717,11 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif parsed.path == "/api/logs":
             self._send_json({"ok": True, "logs": fetch_vm_run_history()})
+        elif parsed.path == "/api/network":
+            self._send_json({"ok": True, "network": fetch_vm_network_usage(),
+                             "monthly_limit_bytes": 1 * 1024 * 1024 * 1024})
+        elif parsed.path == "/api/timer":
+            self._send_json({"ok": True, "timer": fetch_vm_timer_status()})
         elif parsed.path == "/api/auth":
             ok, out, err = run_gcloud(["auth", "login", "--no-launch-browser",
                                        "--brief"], timeout=300)

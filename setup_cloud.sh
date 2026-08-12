@@ -55,13 +55,19 @@ StandardError=append:$LOG
 EOF
 
 # Create a systemd timer that fires every 10 min, Mon-Fri, during market hours (13-21 UTC)
+#
+# IMPORTANT: the calendar expression below is deliberately written as an hour
+# range with a minute step ("13..21:00/10:00"). The alternative
+# "Mon-Fri *-*-* 13:00/10:00" is a well-known systemd gotcha: combining a
+# day-of-week filter with a "/STEP" time makes the timer fire only ONCE (at
+# 13:00) instead of every 10 minutes. The range form below repeats reliably.
 TIMER_FILE="/etc/systemd/system/portfolioismoving.timer"
 sudo tee "$TIMER_FILE" > /dev/null <<EOF
 [Unit]
 Description=Run PortfolioIsMoving every 10 min during market hours
 
 [Timer]
-OnCalendar=Mon-Fri *-*-* 13:00/10:00
+OnCalendar=Mon-Fri *-*-* 13..21:00/10:00
 Persistent=true
 
 [Install]
@@ -74,6 +80,12 @@ sudo systemctl enable portfolioismoving.timer
 sudo systemctl start portfolioismoving.timer
 
 echo "  Timer installed: every 10 min, Mon-Fri, 13:00-21:00 UTC"
+
+# Verify the timer is actually armed and show its next fire time. If this
+# prints nothing for "Next elapse", the schedule did not take effect.
+echo "  Timer status:"
+systemctl list-timers portfolioismoving.timer --no-pager || true
+echo "  Active state: $(systemctl is-active portfolioismoving.timer 2>/dev/null || echo 'unknown')"
 
 # --- 4. Run once to confirm it works
 echo "[4/4] Running monitor.py once to test..."
