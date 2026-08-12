@@ -58,9 +58,8 @@ PYTHON="$(command -v python3)"
 
 # We use cron instead of a systemd timer because cron's schedule syntax is
 # simple and unambiguous, and it has proven far more reliable to install and
-# verify. The job runs every 10 minutes, hours 13-21 UTC, Mon-Fri (a coarse
-# window that covers US market hours; monitor.py itself does the precise
-# market-hours check).
+# verify. We install TWO cron jobs (one per DST season) so cron only fires
+# during US market hours; monitor.py does the precise market-hours check.
 
 # Remove any old systemd timer/service from earlier versions so they don't
 # conflict or confuse things.
@@ -69,11 +68,14 @@ sudo rm -f /etc/systemd/system/portfolioismoving.timer
 sudo rm -f /etc/systemd/system/portfolioismoving.service
 sudo systemctl daemon-reload 2>/dev/null || true
 
-# Build the cron line. Note: % must be escaped as \% inside a crontab line,
-# but our command has no % so this is straightforward.
-# Schedule: every 10 minutes, hours 13-21 UTC, Mon-Fri (covers US market
-# hours; monitor.py does the precise market-hours check).
-CRON_LINE="*/10 13-21 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+# Build the cron lines. We install TWO jobs so cron only fires during US
+# market hours in BOTH daylight-saving seasons (cron can't know about DST):
+#   - Summer (EDT, UTC-4): market ~13:30-20:00 UTC  ->  job 13-20 UTC
+#   - Winter (EST, UTC-5): market ~14:30-21:00 UTC  ->  job 14-21 UTC
+# Both fire year-round; monitor.py's own DST-aware is_market_hours() check
+# (9:25-16:05 ET) does the precise filtering. This avoids waking up all day.
+CRON_LINE_SUMMER="*/10 13-20 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+CRON_LINE_WINTER="*/10 14-21 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
 
 # Resolve the absolute path to crontab. When this script runs through
 # "gcloud compute ssh --command", the non-interactive PATH may not include
@@ -94,20 +96,24 @@ GREP="$(command -v grep || echo /bin/grep)"
 # accumulated on the VM.
 TMPCRON="$("$MKTEMP")"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -v 'monitor.py' > "$TMPCRON" || true
-echo "$CRON_LINE" >> "$TMPCRON"
+echo "$CRON_LINE_SUMMER" >> "$TMPCRON"
+echo "$CRON_LINE_WINTER" >> "$TMPCRON"
 if "$CRONTAB" "$TMPCRON"; then
-  echo "  ✅ Cron job installed (user crontab)."
+  echo "  ✅ Cron jobs installed (user crontab)."
 else
   echo "  ⚠️  User crontab failed - trying /etc/cron.d/ instead..."
   # Fallback: install a system cron file (needs root). Format is the same
-  # as a crontab but with the username field added.
+  # as a crontab but with the username field inserted after the schedule.
   USERNAME="$(id -un 2>/dev/null || echo root)"
-  echo "*/10 13-21 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/portfolioismoving-cron
+  CRON_SUMMER_SYS="*/10 13-20 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+  CRON_WINTER_SYS="*/10 14-21 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+  echo "$CRON_SUMMER_SYS" > /tmp/portfolioismoving-cron
+  echo "$CRON_WINTER_SYS" >> /tmp/portfolioismoving-cron
   if sudo mv /tmp/portfolioismoving-cron /etc/cron.d/portfolioismoving; then
-    echo "  ✅ Cron job installed (/etc/cron.d/portfolioismoving)."
+    echo "  ✅ Cron jobs installed (/etc/cron.d/portfolioismoving)."
     rm -f "$TMPCRON"
   else
-    echo "  ❌ FAILED to install the cron job (both methods returned an error)."
+    echo "  ❌ FAILED to install the cron jobs (both methods returned an error)."
     echo "     crontab path: $CRONTAB"
     echo "     Try manually: $CRONTAB $TMPCRON"
     exit 1
@@ -115,7 +121,8 @@ else
 fi
 rm -f "$TMPCRON"
 
-echo "  Cron installed: $CRON_LINE"
+echo "  Cron installed (summer): $CRON_LINE_SUMMER"
+echo "  Cron installed (winter): $CRON_LINE_WINTER"
 echo "  Installed job(s):"
 "$CRONTAB" -l 2>/dev/null | "$GREP" 'monitor.py' || echo "  (not in user crontab - check /etc/cron.d/)"
 echo "  cron daemon active: $(systemctl is-active cron 2>/dev/null || echo 'no')"

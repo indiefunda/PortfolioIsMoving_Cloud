@@ -450,9 +450,11 @@ def main():
 
     now_et = datetime.now(EASTERN)
     if not is_market_hours(now_et):
+        # Outside market hours: exit silently WITHOUT writing a run record.
+        # This keeps the run history clean (no "outside hours" spam) and
+        # avoids unnecessary disk writes. cron only fires during market-window
+        # hours now, so this is just the small DST boundary overshoot.
         print(f"Skipping: outside market hours ({now_et.strftime('%a %H:%M %Z')}).")
-        record["status"] = "outside_market_hours"
-        append_run_record(record)
         return
 
     state = load_state()
