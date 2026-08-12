@@ -13,6 +13,7 @@ secrets_local.json
 
 # Runtime state
 state.json
+run_history.json
 
 # OS
 Thumbs.db

@@ -200,6 +200,32 @@ def vm_status():
     return None
 
 
+def fetch_vm_run_history():
+    """
+    Read the monitor's run_history.json from the VM. Returns a list of run
+    records (newest first), or [] if the VM/file isn't reachable yet.
+    """
+    zone = find_vm_zone()
+    if not zone:
+        return []
+    # Resolve the VM's actual home directory so we read the right file.
+    ok_home, home, _ = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", "echo $HOME", "--quiet"], timeout=60)
+    home = home.strip() if ok_home and home.strip() else "/home/Achilles"
+    ok, out, err = run_gcloud([
+        "compute", "ssh", "--zone", zone, VM_NAME,
+        "--command", f"cat {home}/run_history.json 2>/dev/null || echo '[]'",
+        "--quiet"], timeout=60)
+    if not ok:
+        return []
+    try:
+        data = json.loads(out)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # HTML dashboard
 # ---------------------------------------------------------------------------
@@ -254,6 +280,24 @@ HTML = """<!DOCTYPE html>
   .log { background:#0a0c10; border:1px solid var(--border); border-radius:8px;
          padding:10px; font-family:monospace; font-size:12px; color:#9fe8a0;
          max-height:200px; overflow:auto; white-space:pre-wrap; }
+  .tablewrap { overflow:auto; max-height:420px; border:1px solid var(--border);
+               border-radius:8px; margin-top:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border);
+           white-space:nowrap; }
+  th { position:sticky; top:0; background:#12151c; color:var(--muted); font-size:12px;
+       text-transform:uppercase; letter-spacing:.03em; }
+  td.pct { text-align:right; font-variant-numeric:tabular-nums; }
+  .pos { color:var(--ok); } .neg { color:var(--err); }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px;
+           font-weight:600; }
+  .badge.ok { background:#14532d; color:#a7f3d0; }
+  .badge.err { background:#7c2d12; color:#fecaca; }
+  .badge.warn { background:#713f12; color:#fde68a; }
+  .badge.gray { background:#2a2e38; color:#cbd5e1; }
+  .empty { color:var(--muted); text-align:center; padding:24px; font-size:13px; }
+  details { font-size:12px; color:var(--muted); }
+  summary { cursor:pointer; color:var(--accent); }
 </style>
 </head>
 <body>
@@ -329,6 +373,15 @@ HTML = """<!DOCTYPE html>
     <div class="log" id="log">Command output will appear here.</div>
   </div>
 
+  <!-- Step 6: Run history -->
+  <div class="card">
+    <h2>6. What the monitor saw (run history)</h2>
+    <div class="status" id="logStatus">—</div>
+    <button class="btn-ghost" onclick="loadLogs()">↻ Refresh run history</button>
+    <div class="hint">Shows every run from the cloud server: when it ran, how long it took, what prices it saw (even when no alert was sent), and whether alerts went out. The newest run is on top.</div>
+    <div id="logTableWrap"></div>
+  </div>
+
 <script>
 let tickers = [];
 function $(id){ return document.getElementById(id); }
@@ -363,6 +416,7 @@ async function load(){
   $('chatid').value = d.secrets.telegram_chat_id || '';
   renderChips(); updateProviderUI();
   refreshStatus();
+  loadLogs();
 }
 
 async function refreshStatus(){
@@ -424,6 +478,67 @@ async function testAlert(){
   $('log').textContent = d.output || '';
   showMsg(d.ok ? '✅ Test alert sent (check Telegram)' : '❌ '+d.error, d.ok?'ok':'err'); }
 
+function badgeFor(status){
+  switch(status){
+    case 'ran': return '<span class="badge ok">ran</span>';
+    case 'disabled': return '<span class="badge warn">disabled</span>';
+    case 'outside_market_hours': return '<span class="badge gray">outside hours</span>';
+    case 'error': return '<span class="badge err">error</span>';
+    default: return '<span class="badge gray">'+(status||'?')+'</span>';
+  }
+}
+
+async function loadLogs(){
+  $('logStatus').textContent = 'Fetching run history from the server...';
+  const d = await api('/api/logs');
+  renderLogs(d.logs || []);
+}
+
+function renderLogs(logs){
+  const wrap = $('logTableWrap');
+  const status = $('logStatus');
+  if(!logs.length){
+    status.textContent = 'No runs recorded yet.';
+    wrap.innerHTML = '<div class="empty">No run history found. If the server is running, it records a row here every 10 minutes during market hours.</div>';
+    return;
+  }
+  status.textContent = logs.length + (logs.length===1?' run':' runs') + ' recorded (newest first).';
+  let rows = '';
+  for(const r of logs){
+    const dur = (r.duration_sec!=null) ? r.duration_sec+'s' : '—';
+    const alerts = (r.alerts_sent||[]).length;
+    const failed = (r.alerts_failed||[]).length;
+    let alertCell = (alerts||failed) ? (alerts+' sent'+(failed?' / '+failed+' failed':'')) : '—';
+    // Roll up the per-ticker prices into a compact summary.
+    let detail = '';
+    if(r.prices && r.prices.length){
+      const items = r.prices.map(p=>{
+        if(p.pct==null) return '<li><b>'+p.symbol+'</b>: '+ (p.note||'no data') +'</li>';
+        const cls = p.pct>0?'pos':(p.pct<0?'neg':'');
+        return '<li><b>'+p.symbol+'</b>: $'+p.current+' (prev $'+p.prev_close+') = <span class="'+cls+'">'+
+          (p.pct>0?'+':'')+p.pct+'%</span>'+(p.alert?' <span class="badge ok">ALERT</span>':'')+'</li>';
+      }).join('');
+      detail = '<details><summary>Prices seen ('+r.prices.length+')</summary><ul style="margin:6px 0 0;padding-left:18px">'+items+'</ul></details>';
+    }
+    rows += '<tr>'+
+      '<td>'+escapeHtml(r.timestamp||'—')+'</td>'+
+      '<td>'+badgeFor(r.status)+'</td>'+
+      '<td class="pct">'+dur+'</td>'+
+      '<td>'+escapeHtml(r.provider||'—')+'</td>'+
+      '<td class="pct">'+escapeHtml(r.tickers_checked||0)+'</td>'+
+      '<td>'+alertCell+'</td>'+
+      '<td>'+(r.error?escapeHtml(r.error):(detail||'—'))+'</td>'+
+      '</tr>';
+  }
+  wrap.innerHTML = '<div class="tablewrap"><table>'+
+    '<thead><tr><th>Time (ET)</th><th>Status</th><th>Duration</th><th>Provider</th><th>Checked</th><th>Alerts</th><th>Details</th></tr></thead>'+
+    '<tbody>'+rows+'</tbody></table></div>';
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 load();
 </script>
 </body>
@@ -465,6 +580,8 @@ class Handler(BaseHTTPRequestHandler):
                 "auth": auth_status(),
                 "vm": vm_status(),
             })
+        elif parsed.path == "/api/logs":
+            self._send_json({"ok": True, "logs": fetch_vm_run_history()})
         elif parsed.path == "/api/auth":
             ok, out, err = run_gcloud(["auth", "login", "--no-launch-browser",
                                        "--brief"], timeout=300)

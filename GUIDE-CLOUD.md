@@ -84,6 +84,10 @@ In the panel, do these in order:
 5. **Usage & health** → click **"Check usage so far"** and
    **"Send test Telegram alert"** to confirm everything works.
 
+6. **Run history** → the panel shows a table of every run. You can see when
+   the monitor last ran, how long it took, what prices it saw, and whether
+   alerts were sent — even when nothing crossed the threshold.
+
 ---
 
 ## 🟢 PART 4 — That's it! ✅
@@ -119,8 +123,25 @@ No restart needed — the server reads the files fresh every 10 minutes.
 In the panel, click **"Check usage so far"** and **"Send test Telegram
 alert"**. If you get the test message on your phone, everything works.
 
+The **"What the monitor saw (run history)"** section is the best way to see
+what's happening. It shows a table of every run from the server:
+
+- **Time (ET)** — when the monitor ran
+- **Status** — `ran`, `disabled`, `outside hours`, or `error`
+- **Duration** — how long the run took
+- **Provider** — which price source was used
+- **Checked** — how many tickers it looked at
+- **Alerts** — how many alerts were sent / failed
+- **Details** — expandable list of the prices it saw, even when nothing
+  crossed your threshold
+
+If the table is empty or the **Status** column shows `error`, the **Details**
+column will tell you why (e.g. missing Telegram credentials, no config, etc.).
+
 > *(Manual check:)* `cat ~/PortfolioIsMoving/monitor.log` on the server shows
-> a new line every 10 minutes during market hours.
+> a new line every 10 minutes during market hours, and
+> `cat ~/PortfolioIsMoving/run_history.json` holds the structured run records
+> the panel displays.
 
 ---
 
@@ -138,7 +159,7 @@ sudo systemctl disable --now portfolioismoving.timer
 |---------|------------|
 | The panel says "gcloud not installed" | Do Part 1 (install the Google Cloud CLI), then restart the panel. |
 | "Authenticate" doesn't finish | Make sure you completed the login in the browser that opened. |
-| "Server created" but no alerts | In the panel, click **"Upload config to server"**, then **"Send test alert"**. |
+| "Server created" but no alerts | In the panel, click **"Upload config to server"**, then **"Send test alert"**. Also check the **"What the monitor saw"** table — if it shows `error`, read the Details column. If it shows `outside hours`, the market simply isn't open yet. |
 | The free e2-micro isn't available | The panel uses `us-central1-a` (a free region). If it fails, see the manual method below. |
 | You get charged | You shouldn't — the **$1 budget alert** will email you first. If you see it, stop the server immediately. |
 | Card verification fails | Use a different card (a standard bank debit or credit card). Revolut usually works but some banks' cards are rejected. |

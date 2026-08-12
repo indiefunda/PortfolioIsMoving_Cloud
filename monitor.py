@@ -33,6 +33,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config_local.json")
 SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
+RUN_HISTORY_FILE = os.path.join(BASE_DIR, "run_history.json")
+
+# Keep only the most recent runs in the history file (keeps it small on disk).
+RUN_HISTORY_LIMIT = 500
 
 # US Eastern timezone (NY market)
 EASTERN = pytz.timezone("US/Eastern")
@@ -90,6 +94,32 @@ def load_state():
 
 def save_state(state):
     _write_json(STATE_FILE, state)
+
+
+# ---------------------------------------------------------------------------
+# Run history (structured logging, readable by the control panel)
+# ---------------------------------------------------------------------------
+def load_run_history():
+    """Return the list of past run records (newest first)."""
+    records = _read_json(RUN_HISTORY_FILE, [])
+    if not isinstance(records, list):
+        return []
+    return records
+
+
+def append_run_record(record):
+    """
+    Append a single run record to the history file and trim it to the most
+    recent RUN_HISTORY_LIMIT entries. Each record is a dict. This is what the
+    local control panel reads to show you what the monitor saw.
+    """
+    try:
+        records = load_run_history()
+        records.insert(0, record)  # newest first
+        records = records[:RUN_HISTORY_LIMIT]
+        _write_json(RUN_HISTORY_FILE, records)
+    except Exception as exc:
+        print(f"  [error] could not write run history: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -254,19 +284,38 @@ def is_market_hours(now_et):
 
 
 def main():
+    start_time = datetime.now(EASTERN)
+    record = {
+        "timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "status": "ran",
+        "provider": "",
+        "tickers_checked": 0,
+        "prices": [],
+        "alerts_sent": [],
+        "alerts_failed": [],
+        "duration_sec": None,
+        "error": None,
+    }
+
     config = load_config()
     if not config:
         print("No config_local.json found. Run setup_cloud.sh first.")
+        record["status"] = "error"
+        record["error"] = "No config_local.json found."
+        append_run_record(record)
         return
 
     enabled = config.get("enabled", False)
     if not enabled:
         print("Monitoring is DISABLED (enabled=false). Set it to true in config_local.json.")
+        record["status"] = "disabled"
+        append_run_record(record)
         return
 
     tickers = config.get("tickers", [])
     threshold = float(config.get("threshold_pct", 5.0))
     provider = config.get("provider", DEFAULT_PROVIDER)
+    record["provider"] = provider
     secrets = load_secrets()
     token = secrets.get("telegram_bot_token", "")
     chat_id = secrets.get("telegram_chat_id", "")
@@ -274,14 +323,22 @@ def main():
 
     if not tickers:
         print("No tickers configured. Add some to config_local.json.")
+        record["status"] = "error"
+        record["error"] = "No tickers configured."
+        append_run_record(record)
         return
     if not token or not chat_id:
         print("Telegram credentials missing in secrets_local.json.")
+        record["status"] = "error"
+        record["error"] = "Telegram credentials missing in secrets_local.json."
+        append_run_record(record)
         return
 
     now_et = datetime.now(EASTERN)
     if not is_market_hours(now_et):
         print(f"Skipping: outside market hours ({now_et.strftime('%a %H:%M %Z')}).")
+        record["status"] = "outside_market_hours"
+        append_run_record(record)
         return
 
     state = load_state()
@@ -291,6 +348,7 @@ def main():
 
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} ticker(s) "
           f"via {provider}...")
+    record["tickers_checked"] = len(tickers)
 
     prices = get_prices(tickers, provider=provider, api_key=api_key)
 
@@ -306,25 +364,49 @@ def main():
         pair = prices.get(symbol)
         if pair is None:
             print(f"  - {symbol}: no data")
+            record["prices"].append({
+                "symbol": symbol, "current": None, "prev_close": None,
+                "pct": None, "alert": False, "note": "no data",
+            })
             continue
         current, prev_close = pair
 
         if current is None or prev_close is None or prev_close == 0:
             print(f"  - {symbol}: no valid price data")
+            record["prices"].append({
+                "symbol": symbol, "current": current, "prev_close": prev_close,
+                "pct": None, "alert": False, "note": "no valid price data",
+            })
             continue
 
         pct = (current - prev_close) / prev_close * 100
         print(f"  - {symbol}: ${current:.2f} (prev ${prev_close:.2f}) = {pct:+.2f}%")
 
+        alerted = False
         if abs(pct) >= threshold and symbol not in state.get("alerted", []):
             msg = format_alert(symbol, current, prev_close, pct, threshold)
             if send_telegram(token, chat_id, msg):
                 print(f"  -> Alert sent for {symbol}")
                 state.setdefault("alerted", []).append(symbol)
+                record["alerts_sent"].append(symbol)
+                alerted = True
             else:
                 print(f"  -> Alert FAILED for {symbol}")
+                record["alerts_failed"].append(symbol)
+
+        record["prices"].append({
+            "symbol": symbol,
+            "current": round(current, 4),
+            "prev_close": round(prev_close, 4),
+            "pct": round(pct, 2),
+            "alert": alerted,
+            "note": None,
+        })
 
     save_state(state)
+
+    record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
+    append_run_record(record)
 
 
 if __name__ == "__main__":
