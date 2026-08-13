@@ -68,14 +68,19 @@ sudo rm -f /etc/systemd/system/portfolioismoving.timer
 sudo rm -f /etc/systemd/system/portfolioismoving.service
 sudo systemctl daemon-reload 2>/dev/null || true
 
-# Build the cron lines. We install TWO jobs so cron only fires during US
-# market hours in BOTH daylight-saving seasons (cron can't know about DST):
-#   - Summer (EDT, UTC-4): market ~13:30-20:00 UTC  ->  job 13-20 UTC
-#   - Winter (EST, UTC-5): market ~14:30-21:00 UTC  ->  job 14-21 UTC
-# Both fire year-round; monitor.py's own DST-aware is_market_hours() check
-# (9:25-16:05 ET) does the precise filtering. This avoids waking up all day.
-CRON_LINE_SUMMER="*/10 13-20 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-CRON_LINE_WINTER="*/10 14-21 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+# Build the cron line. We install ONE job whose window is the UNION of both
+# US-market DST seasons, so it fires in summer AND winter without overlap:
+#   - Summer (EDT, UTC-4): market ~13:30-20:00 UTC
+#   - Winter (EST, UTC-5): market ~14:30-21:00 UTC
+#   - Union window: 13:00-21:59 UTC  ->  single job "*/10 13-21"
+# monitor.py's own DST-aware is_market_hours() check (9:25-16:05 ET) does the
+# precise filtering, so the extra fires just before/after market hours are
+# skipped harmlessly. Using ONE job (instead of the old two-job approach)
+# guarantees monitor.py NEVER runs twice at the same minute, which previously
+# caused duplicate API calls, wasted free-tier egress, and race conditions
+# where concurrent runs overwrote each other's run-history records (the
+# "it runs very rarely" bug).
+CRON_LINE="*/10 13-21 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
 
 # Resolve the absolute path to crontab. When this script runs through
 # "gcloud compute ssh --command", the non-interactive PATH may not include
@@ -96,24 +101,21 @@ GREP="$(command -v grep || echo /bin/grep)"
 # accumulated on the VM.
 TMPCRON="$("$MKTEMP")"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -v 'monitor.py' > "$TMPCRON" || true
-echo "$CRON_LINE_SUMMER" >> "$TMPCRON"
-echo "$CRON_LINE_WINTER" >> "$TMPCRON"
+echo "$CRON_LINE" >> "$TMPCRON"
 if "$CRONTAB" "$TMPCRON"; then
-  echo "  ✅ Cron jobs installed (user crontab)."
+  echo "  ✅ Cron job installed (user crontab)."
 else
   echo "  ⚠️  User crontab failed - trying /etc/cron.d/ instead..."
   # Fallback: install a system cron file (needs root). Format is the same
   # as a crontab but with the username field inserted after the schedule.
   USERNAME="$(id -un 2>/dev/null || echo root)"
-  CRON_SUMMER_SYS="*/10 13-20 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-  CRON_WINTER_SYS="*/10 14-21 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-  echo "$CRON_SUMMER_SYS" > /tmp/portfolioismoving-cron
-  echo "$CRON_WINTER_SYS" >> /tmp/portfolioismoving-cron
+  CRON_SYS="*/10 13-21 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+  echo "$CRON_SYS" > /tmp/portfolioismoving-cron
   if sudo mv /tmp/portfolioismoving-cron /etc/cron.d/portfolioismoving; then
-    echo "  ✅ Cron jobs installed (/etc/cron.d/portfolioismoving)."
+    echo "  ✅ Cron job installed (/etc/cron.d/portfolioismoving)."
     rm -f "$TMPCRON"
   else
-    echo "  ❌ FAILED to install the cron jobs (both methods returned an error)."
+    echo "  ❌ FAILED to install the cron job (both methods returned an error)."
     echo "     crontab path: $CRONTAB"
     echo "     Try manually: $CRONTAB $TMPCRON"
     exit 1
@@ -121,8 +123,7 @@ else
 fi
 rm -f "$TMPCRON"
 
-echo "  Cron installed (summer): $CRON_LINE_SUMMER"
-echo "  Cron installed (winter): $CRON_LINE_WINTER"
+echo "  Cron installed: $CRON_LINE"
 echo "  Installed job(s):"
 "$CRONTAB" -l 2>/dev/null | "$GREP" 'monitor.py' || echo "  (not in user crontab - check /etc/cron.d/)"
 echo "  cron daemon active: $(systemctl is-active cron 2>/dev/null || echo 'no')"
@@ -142,8 +143,8 @@ echo " To check it's working:"
 echo "   cat $LOG"
 echo ""
 echo " To see the schedule:"
-echo "   crontab -l | grep portfolioismoving"
+echo "   crontab -l | grep monitor.py"
 echo ""
 echo " To stop it (if you ever need to):"
-echo "   crontab -l | grep -v portfolioismoving | crontab -"
+echo "   crontab -l | grep -v monitor.py | crontab -"
 echo "=============================================="

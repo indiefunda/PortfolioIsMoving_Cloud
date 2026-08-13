@@ -175,7 +175,7 @@ it reflects real bytes the monitor sent — no extra Google setup needed.
 Remove the cron job:
 
 ```bash
-crontab -l | grep -v portfolioismoving | crontab -
+crontab -l | grep -v monitor.py | crontab -
 ```
 
 ---

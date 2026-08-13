@@ -21,7 +21,7 @@ Alerts: Telegram bot (free)
 import json
 import os
 import sys
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -35,6 +35,7 @@ SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 RUN_HISTORY_FILE = os.path.join(BASE_DIR, "run_history.json")
 NETWORK_USAGE_FILE = os.path.join(BASE_DIR, "network_usage.json")
+LOG_FILE = os.path.join(BASE_DIR, "monitor.log")
 
 # Keep only the most recent runs in the history file (keeps it small on disk).
 RUN_HISTORY_LIMIT = 500
@@ -73,6 +74,27 @@ TWELVE_BATCH_SIZE = 8
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
+# A simple cross-platform advisory lock so that if monitor.py ever gets
+# launched twice at the same moment (e.g. two overlapping cron fires), the
+# read-modify-write of run_history.json / state.json / network_usage.json
+# can't race and silently drop records. On Linux this uses flock(); on other
+# OSes it degrades to no-op (still safe, just not locked).
+try:
+    import fcntl  # POSIX only
+
+    def _lock_file(f):
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+    def _unlock_file(f):
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+except ImportError:  # Windows / non-POSIX
+    def _lock_file(f):
+        pass
+
+    def _unlock_file(f):
+        pass
+
+
 def _read_json(path, default):
     if os.path.exists(path):
         try:
@@ -101,7 +123,14 @@ def load_state():
 
 
 def save_state(state):
-    _write_json(STATE_FILE, state)
+    # Lock so two overlapping runs can't clobber each other's alert levels.
+    try:
+        with open(STATE_FILE, "a+", encoding="utf-8") as lock_handle:
+            _lock_file(lock_handle)
+            _write_json(STATE_FILE, state)
+            _unlock_file(lock_handle)
+    except Exception as exc:
+        print(f"  [error] could not write state: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +151,100 @@ def append_run_record(record):
     local control panel reads to show you what the monitor saw.
     """
     try:
-        records = load_run_history()
-        records.insert(0, record)  # newest first
-        records = records[:RUN_HISTORY_LIMIT]
-        _write_json(RUN_HISTORY_FILE, records)
+        # Lock the history file while we read-modify-write it. Without this,
+        # two overlapping runs (e.g. the old double-cron bug) could both read
+        # the same list, both insert, and one overwrite would erase the other
+        # run's record — making runs look like they "never happened".
+        with open(RUN_HISTORY_FILE, "a+", encoding="utf-8") as lock_handle:
+            _lock_file(lock_handle)
+            lock_handle.seek(0)
+            records = load_run_history()
+            records.insert(0, record)  # newest first
+            records = records[:RUN_HISTORY_LIMIT]
+            _write_json(RUN_HISTORY_FILE, records)
+            _unlock_file(lock_handle)
     except Exception as exc:
         print(f"  [error] could not write run history: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Data retention / cleanup
+# ---------------------------------------------------------------------------
+# The VM is a tiny free e2-micro instance with a small boot disk. These
+# routines run once per cron fire (cheap) to make sure the files that grow
+# over time never balloon: the log, the run history, and the per-day egress
+# tally are all trimmed so we only keep the last ~7 days. This stops the disk
+# from slowly filling up with garbage on a weak free server.
+RETENTION_DAYS = 7
+LOG_MAX_BYTES = 1024 * 1024  # keep monitor.log bounded under ~1 MB
+
+
+def _is_within_days(timestamp_str, days):
+    """True if a record timestamp like '2026-08-13 11:50:01 EDT' (or just a
+    'YYYY-MM-DD' date) is within the last `days` days."""
+    if not timestamp_str:
+        return True  # keep records with no timestamp rather than drop them
+    try:
+        date_part = str(timestamp_str).split()[0]
+        rec_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+    except (ValueError, IndexError):
+        return True
+    cutoff = datetime.now(EASTERN).date() - timedelta(days=days)
+    return rec_date >= cutoff
+
+
+def cleanup_old_data():
+    """Trim the files that accumulate over time so the free VM never fills
+    its small disk. Call once at the start of every run (cheap)."""
+    # 1) monitor.log -> keep only the last ~1 MB (bounded disk usage). This
+    #    file is appended to by cron every run and would otherwise grow
+    #    forever; trimming by size is the robust way to bound it.
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_MAX_BYTES, os.SEEK_END)
+                tail = f.read()
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail)
+    except Exception as exc:
+        print(f"  [error] could not trim log: {exc}", file=sys.stderr)
+
+    # 2) run_history.json -> drop records older than RETENTION_DAYS so we only
+    #    keep about a week of history, not months.
+    try:
+        if os.path.exists(RUN_HISTORY_FILE):
+            with open(RUN_HISTORY_FILE, "a+", encoding="utf-8") as lock_handle:
+                _lock_file(lock_handle)
+                lock_handle.seek(0)
+                records = load_run_history()
+                kept = [r for r in records
+                        if _is_within_days(r.get("timestamp"), RETENTION_DAYS)]
+                if len(kept) != len(records):
+                    _write_json(RUN_HISTORY_FILE, kept)
+                _unlock_file(lock_handle)
+    except Exception as exc:
+        print(f"  [error] could not trim run history: {exc}", file=sys.stderr)
+
+    # 3) network_usage.json -> keep only the last RETENTION_DAYS of per-day
+    #    tallies (the running monthly total is kept as-is).
+    try:
+        if os.path.exists(NETWORK_USAGE_FILE):
+            with open(NETWORK_USAGE_FILE, "a+", encoding="utf-8") as lock_handle:
+                _lock_file(lock_handle)
+                lock_handle.seek(0)
+                data = load_network_usage()
+                days = data.get("days", {})
+                if days:
+                    kept_days = {
+                        d: v for d, v in days.items()
+                        if _is_within_days(d, RETENTION_DAYS)
+                    }
+                    if len(kept_days) != len(days):
+                        data["days"] = kept_days
+                        save_network_usage(data)
+                _unlock_file(lock_handle)
+    except Exception as exc:
+        print(f"  [error] could not trim network usage: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +308,26 @@ def record_network_usage(run_egress_bytes):
     now_et = datetime.now(EASTERN)
     month = now_et.strftime("%Y-%m")
     day = now_et.strftime("%Y-%m-%d")
-    data = load_network_usage()
-    if data.get("month") != month:
-        # New month - start a fresh tally for this month.
-        data = {"month": month, "monthly_bytes": 0, "days": {}}
-    data["monthly_bytes"] = data.get("monthly_bytes", 0) + run_egress_bytes
-    days = data.setdefault("days", {})
-    days[day] = int(days.get(day, 0)) + run_egress_bytes
-    save_network_usage(data)
-    return data
+    try:
+        # Lock the tally while we read-modify-write it, so two overlapping
+        # runs can't both start from the same baseline and lose each other's
+        # bytes (which would under-count our free-tier egress).
+        with open(NETWORK_USAGE_FILE, "a+", encoding="utf-8") as lock_handle:
+            _lock_file(lock_handle)
+            lock_handle.seek(0)
+            data = load_network_usage()
+            if data.get("month") != month:
+                # New month - start a fresh tally for this month.
+                data = {"month": month, "monthly_bytes": 0, "days": {}}
+            data["monthly_bytes"] = data.get("monthly_bytes", 0) + run_egress_bytes
+            days = data.setdefault("days", {})
+            days[day] = int(days.get(day, 0)) + run_egress_bytes
+            save_network_usage(data)
+            _unlock_file(lock_handle)
+        return data
+    except Exception as exc:
+        print(f"  [error] could not record network usage: {exc}", file=sys.stderr)
+        return load_network_usage()
 
 
 def format_bytes(n):
@@ -406,6 +534,10 @@ def main():
         "egress_bytes": None,
         "error": None,
     }
+
+    # Trim old log/history/egress data first so the free VM's small disk
+    # never fills up with accumulated garbage. Cheap: runs every cron fire.
+    cleanup_old_data()
 
     config = load_config()
     if not config:

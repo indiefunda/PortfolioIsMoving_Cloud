@@ -290,10 +290,14 @@ def fetch_vm_timer_status():
         "--quiet"], timeout=60)
     cron_enabled = (enabled_out.strip() if ok_enabled else "unknown")
 
-    # Is the cron job installed?
+    # Is the cron job installed? The cron line contains "monitor.py" (the
+    # marker unique to our job); the schedule never contains the word
+    # "portfolioismoving", so we MUST grep for "monitor.py". Grepping the
+    # wrong marker made the panel always report "Schedule is NOT installed"
+    # even when the job was actually present.
     ok, out, _ = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "crontab -l 2>/dev/null | grep 'portfolioismoving' || true",
+        "--command", "crontab -l 2>/dev/null | grep 'monitor.py' || true",
         "--quiet"], timeout=60)
     cron_line = out.strip() if ok else ""
     installed = bool(cron_line)
@@ -538,10 +542,10 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Opens Google's official billing console in a new tab — the real source of truth for your cost.</div>
     <button class="btn-ghost" onclick="testAlert()">📲 Send test Telegram alert</button>
     <div class="log" id="log">Command output will appear here.</div>
-    <label style="margin-top:16px">Network egress (free-tier usage)</label>
+    <label style="margin-top:16px">Network egress — this monitor only</label>
     <div class="status" id="netStatus">—</div>
     <button class="btn-ghost" onclick="loadNetwork()">↻ Refresh network usage</button>
-    <div class="hint">Your free Google Cloud tier includes 1 GB of outbound traffic per month (from N. America). This is measured on the server, so it reflects real bytes sent by the monitor.</div>
+    <div class="hint">This shows the outbound traffic <b>this monitor</b> used (measured on the server during its runs). It is <b>NOT the whole VM's usage</b> — other apps on the same server are not counted. Your free tier allows 1 GB of outbound traffic per month (from N. America).</div>
   </div>
 
   <!-- Step 6: Run history -->
@@ -735,15 +739,15 @@ function renderNetwork(net, limitBytes){
     return;
   }
   const monthly = net.monthly_bytes || 0;
-  const today = net.days ? (net.days[Object.keys(net.days).sort().pop()] || 0) : 0;
   const pct = limitBytes ? (monthly/limitBytes*100) : 0;
   const dot = pct >= 80 ? 'red' : (pct >= 50 ? 'gray' : 'green');
-  let html = '<span class="dot '+dot+'"></span><b>This month ('+net.month+'):</b> '+formatBytes(monthly)+
+  let html = '<span class="dot '+dot+'"></span><b>This monitor, this month ('+net.month+'):</b> '+formatBytes(monthly)+
     ' of '+formatBytes(limitBytes)+' free ('+pct.toFixed(2)+'%)';
+  // Show ONLY today's usage, not a growing list of every day in the month.
   const dayKeys = net.days ? Object.keys(net.days).sort() : [];
   if(dayKeys.length){
-    html += '<br>Per day: ';
-    html += dayKeys.map(k=>k+' = '+formatBytes(net.days[k])).join(' &nbsp;·&nbsp; ');
+    const todayKey = dayKeys[dayKeys.length-1];
+    html += '<br><b>This monitor, today ('+todayKey+'):</b> '+formatBytes(net.days[todayKey]);
   }
   el.innerHTML = html;
 }
