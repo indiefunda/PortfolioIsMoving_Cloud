@@ -377,8 +377,12 @@ def get_provider_usage(provider, api_key):
 
 
 def _fetch_twelvedata(symbols, api_key):
+    """
+    Return the live price from twelvedata as {symbol: current_price}. The
+    previous-close anchor is fetched separately from Yahoo (see get_prices),
+    so the % move is always measured against the real last trading day's close.
+    """
     global last_usage, last_call_bytes
-    result = {}
     live = {}
     used_min = None
     left_min = None
@@ -409,22 +413,21 @@ def _fetch_twelvedata(symbols, api_key):
         except Exception as exc:
             print(f"  [error] twelvedata price: {exc}", file=sys.stderr)
 
-    prev = _fetch_yahoo(symbols)
-    for sym in symbols:
-        sym = sym.upper()
-        if sym in live and sym in prev and prev[sym] is not None:
-            result[sym] = (live[sym], prev[sym])
-        elif sym in live:
-            result[sym] = (live[sym], live[sym])
-
     if used_min is not None:
         last_usage = {"used_min": used_min, "left_min": left_min, "limit_min": 8}
-    return result
+    return live
 
 
 def _fetch_finnhub(symbols, api_key):
+    """
+    Return the live price from finnhub as {symbol: current_price}. The
+    previous-close anchor is fetched separately from Yahoo (see get_prices),
+    so the % move is always measured against the real last trading day's close
+    (Finnhub's own 'pc' field is unreliable and can report a stale/wrong
+    previous close, which caused wrong % moves like HUIZ showing -22%).
+    """
     global last_usage, last_call_bytes
-    result = {}
+    live = {}
     used_min = 0
     for sym in symbols:
         sym = sym.upper()
@@ -437,15 +440,47 @@ def _fetch_finnhub(symbols, api_key):
             used_min += 1
             data = resp.json()
             if "c" in data and data["c"]:
-                current = float(data["c"])
-                prev_close = float(data.get("pc") or current)
-                result[sym] = (current, prev_close)
+                live[sym] = float(data["c"])
                 last_call_bytes[sym] = len(resp.content)
         except Exception as exc:
             print(f"  [error] finnhub {sym}: {exc}", file=sys.stderr)
     if used_min:
         last_usage = {"used_min": used_min, "left_min": 60 - used_min, "limit_min": 60}
-    return result
+    return live
+
+
+def _last_completed_close(chart):
+    """
+    Return the close of the LAST COMPLETED trading day from a Yahoo chart
+    response, or None if it can't be determined.
+
+    Yahoo's 'chartPreviousClose' meta field is NOT reliable — after a data
+    glitch or a one-off spike it can point several days back (e.g. HUIZ
+    reported $1.66 from 08/07 instead of $1.29 from 08/13). Instead we read
+    the real daily closes from the chart's timestamp + quote.close arrays and
+    take the close of the most recent day that is strictly BEFORE today (ET),
+    i.e. the last fully-finished trading day. That is the correct anchor for
+    measuring today's % move.
+    """
+    try:
+        timestamps = chart.get("timestamp") or []
+        closes = (chart.get("indicators", {})
+                  .get("quote", [{}])[0].get("close") or [])
+        if not timestamps or len(closes) < len(timestamps):
+            return None
+        today_et = datetime.now(EASTERN).date()
+        # Walk from the newest bar backwards; the first bar whose date is
+        # strictly before today is the last completed trading day.
+        for i in range(len(timestamps) - 1, -1, -1):
+            bar_date = datetime.fromtimestamp(timestamps[i], ZoneInfo("UTC")).date()
+            if bar_date < today_et:
+                close = closes[i]
+                if close:
+                    return float(close)
+                return None
+    except Exception:
+        return None
+    return None
 
 
 def _fetch_yahoo(symbols):
@@ -460,7 +495,7 @@ def _fetch_yahoo(symbols):
             chart = data.get("chart", {}).get("result", [{}])[0]
             meta = chart.get("meta", {})
             current = meta.get("regularMarketPrice")
-            prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+            prev_close = _last_completed_close(chart) or meta.get("previousClose")
             if current is not None:
                 result[sym] = (float(current), float(prev_close) if prev_close else float(current))
                 last_call_bytes[sym] = len(resp.content)
@@ -469,19 +504,72 @@ def _fetch_yahoo(symbols):
     return result
 
 
+def _fetch_yahoo_anchor(symbols):
+    """
+    Return {symbol: prev_close} where prev_close is the REAL last completed
+    trading day's close, read from Yahoo's daily close array (NOT the
+    unreliable 'chartPreviousClose' meta field, which can point several days
+    back after a data glitch). This is the anchor every % move is measured
+    against, and it resets correctly each trading day.
+    """
+    global last_call_bytes
+    anchors = {}
+    for sym in symbols:
+        sym = sym.upper()
+        try:
+            resp = requests.get(YAHOO_QUOTE.format(symbol=sym), headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            chart = data.get("chart", {}).get("result", [{}])[0]
+            prev_close = _last_completed_close(chart)
+            if prev_close:
+                anchors[sym] = prev_close
+                last_call_bytes[sym] = len(resp.content)
+        except Exception as exc:
+            print(f"  [error] yahoo anchor {sym}: {exc}", file=sys.stderr)
+    return anchors
+
+
 def get_prices(symbols, provider=DEFAULT_PROVIDER, api_key=""):
+    """
+    Get {symbol: (current, prev_close)} for the given symbols.
+
+    current    = live price from the configured provider (finnhub/twelvedata/yahoo)
+    prev_close = the REAL last trading day's close, always fetched from Yahoo.
+
+    Measuring every % move against Yahoo's previous close (instead of the
+    provider's own 'previous close' field) means alerts always relate to the
+    last trading day's close and reset correctly each day, even when a
+    provider reports a stale value.
+    """
     symbols = [s.strip().upper() for s in symbols if s.strip()]
     last_call_bytes.clear()
     if not symbols:
         return {}, {}
     provider = (provider or DEFAULT_PROVIDER).lower()
+
+    # Live prices from the configured provider.
     if provider == "twelvedata" and api_key:
-        prices = _fetch_twelvedata(symbols, api_key)
+        live = _fetch_twelvedata(symbols, api_key)
     elif provider == "finnhub" and api_key:
-        prices = _fetch_finnhub(symbols, api_key)
+        live = _fetch_finnhub(symbols, api_key)
     else:
-        prices = _fetch_yahoo(symbols)
-    return prices, dict(last_call_bytes)
+        # Yahoo is the provider: it already returns (current, prev_close).
+        yahoo = _fetch_yahoo(symbols)
+        return yahoo, dict(last_call_bytes)
+
+    # Anchor (last trading day's close) always comes from Yahoo.
+    anchors = _fetch_yahoo_anchor(symbols)
+
+    # Merge: live price + Yahoo anchor. If Yahoo fails for a symbol, fall back
+    # to the live price itself (treat it as flat) so we never crash on it.
+    result = {}
+    for sym in symbols:
+        if sym in live:
+            current = live[sym]
+            prev_close = anchors.get(sym, current)
+            result[sym] = (current, prev_close)
+    return result, dict(last_call_bytes)
 
 
 def send_telegram(token, chat_id, message):
