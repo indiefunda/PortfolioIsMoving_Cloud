@@ -73,6 +73,17 @@ HEADERS = {
 DEFAULT_PROVIDER = "finnhub"
 TWELVE_BATCH_SIZE = 8
 
+# --- Price trust -----------------------------------------------------------
+# Finnhub's quote "c" is the LAST TRADE price ("t" = that trade's timestamp),
+# not the official close and not a bid/ask midpoint. On low-volume tickers -
+# and in the seconds around the 16:00 close - that single print can be noisy,
+# stale, or a cached response that lags the tape. So before alerting we
+# (1) reject quotes whose last trade is too old, and (2) cross-check against
+# Yahoo's current price (delayed ~15 min, but a consistent second opinion).
+# An alert only fires when the provider's price is trusted.
+STALE_QUOTE_SECONDS = 5 * 60   # last trade older than this (during market hours) = stale
+PRICE_DISPUTE_PCT = 1.0        # |provider - yahoo| / yahoo above this = disputed
+
 
 # ---------------------------------------------------------------------------
 # File helpers
@@ -491,11 +502,15 @@ def _fetch_twelvedata(symbols, api_key):
 
 def _fetch_finnhub(symbols, api_key):
     """
-    Return the live price from finnhub as {symbol: current_price}. The
-    previous-close anchor is fetched separately from Yahoo (see get_prices),
-    so the % move is always measured against the real last trading day's close
-    (Finnhub's own 'pc' field is unreliable and can report a stale/wrong
-    previous close, which caused wrong % moves like HUIZ showing -22%).
+    Return the live quote from finnhub as
+    {symbol: {"price": float, "trade_ts": int|None}}. "trade_ts" is the unix
+    timestamp of the LAST TRADE behind that price (the quote's "t" field); it
+    lets us detect stale quotes on low-volume tickers instead of trusting a
+    possibly hours-old print. The previous-close anchor is fetched separately
+    from Yahoo (see get_prices), so the % move is always measured against the
+    real last trading day's close (Finnhub's own 'pc' field is unreliable and
+    can report a stale/wrong previous close, which caused wrong % moves like
+    HUIZ showing -22%).
     """
     global last_usage, last_call_bytes
     live = {}
@@ -511,7 +526,11 @@ def _fetch_finnhub(symbols, api_key):
             used_min += 1
             data = resp.json()
             if "c" in data and data["c"]:
-                live[sym] = float(data["c"])
+                try:
+                    trade_ts = int(data.get("t") or 0) or None
+                except (TypeError, ValueError):
+                    trade_ts = None
+                live[sym] = {"price": float(data["c"]), "trade_ts": trade_ts}
                 last_call_bytes[sym] = len(resp.content)
         except Exception as exc:
             print(f"  [error] finnhub {sym}: {exc}", file=sys.stderr)
@@ -577,11 +596,13 @@ def _fetch_yahoo(symbols):
 
 def _fetch_yahoo_anchor(symbols):
     """
-    Return {symbol: prev_close} where prev_close is the REAL last completed
-    trading day's close, read from Yahoo's daily close array (NOT the
-    unreliable 'chartPreviousClose' meta field, which can point several days
-    back after a data glitch). This is the anchor every % move is measured
-    against, and it resets correctly each trading day.
+    Return {symbol: (prev_close, yahoo_current)} where prev_close is the REAL
+    last completed trading day's close, read from Yahoo's daily close array
+    (NOT the unreliable 'chartPreviousClose' meta field, which can point
+    several days back after a data glitch). This is the anchor every % move is
+    measured against, and it resets correctly each trading day. yahoo_current
+    (Yahoo's regular-market price, delayed ~15 min) is the second opinion used
+    to sanity-check the provider's live quote.
     """
     anchors = {}
     for sym in symbols:
@@ -593,7 +614,10 @@ def _fetch_yahoo_anchor(symbols):
             chart = data.get("chart", {}).get("result", [{}])[0]
             prev_close = _last_completed_close(chart)
             if prev_close:
-                anchors[sym] = prev_close
+                meta = chart.get("meta", {})
+                yahoo_current = meta.get("regularMarketPrice")
+                anchors[sym] = (prev_close,
+                                float(yahoo_current) if yahoo_current else None)
                 # NOTE: deliberately do NOT record this anchor call's bytes in
                 # last_call_bytes. The anchor is a shared/overhead call; the
                 # per-symbol byte figure should reflect the live-price call
@@ -606,10 +630,16 @@ def _fetch_yahoo_anchor(symbols):
 
 def get_prices(symbols, provider=DEFAULT_PROVIDER, api_key=""):
     """
-    Get {symbol: (current, prev_close)} for the given symbols.
+    Get {symbol: (current, prev_close)} plus a per-symbol trust verdict.
 
     current    = live price from the configured provider (finnhub/twelvedata/yahoo)
     prev_close = the REAL last trading day's close, always fetched from Yahoo.
+
+    Returns (result, call_bytes, quality) where quality[symbol] =
+    {"status": "ok"|"stale"|"disputed", "note": str}. A "stale" quote's last
+    trade is older than STALE_QUOTE_SECONDS during market hours; a "disputed"
+    price differs from Yahoo's current price by more than PRICE_DISPUTE_PCT.
+    main() never alerts on a price whose status is not "ok".
 
     Measuring every % move against Yahoo's previous close (instead of the
     provider's own 'previous close' field) means alerts always relate to the
@@ -619,31 +649,65 @@ def get_prices(symbols, provider=DEFAULT_PROVIDER, api_key=""):
     symbols = [s.strip().upper() for s in symbols if s.strip()]
     last_call_bytes.clear()
     if not symbols:
-        return {}, {}
+        return {}, {}, {}
     provider = (provider or DEFAULT_PROVIDER).lower()
 
     # Live prices from the configured provider.
     if provider == "twelvedata" and api_key:
         live = _fetch_twelvedata(symbols, api_key)
+        # twelvedata's /price has no trade timestamp; staleness can't be
+        # checked, but the Yahoo cross-check below still applies.
+        live_meta = {s: {"price": p, "trade_ts": None} for s, p in live.items()}
     elif provider == "finnhub" and api_key:
-        live = _fetch_finnhub(symbols, api_key)
+        live_meta = _fetch_finnhub(symbols, api_key)
+        live = {s: m["price"] for s, m in live_meta.items()}
     else:
         # Yahoo is the provider: it already returns (current, prev_close).
         yahoo = _fetch_yahoo(symbols)
-        return yahoo, dict(last_call_bytes)
+        quality = {s: {"status": "ok", "note": None} for s in yahoo}
+        return yahoo, dict(last_call_bytes), quality
 
-    # Anchor (last trading day's close) always comes from Yahoo.
+    # Anchor (last trading day's close) + second-opinion current price, both
+    # from Yahoo.
     anchors = _fetch_yahoo_anchor(symbols)
 
     # Merge: live price + Yahoo anchor. If Yahoo fails for a symbol, fall back
     # to the live price itself (treat it as flat) so we never crash on it.
     result = {}
+    quality = {}
+    now_et = datetime.now(EASTERN)
     for sym in symbols:
-        if sym in live:
-            current = live[sym]
-            prev_close = anchors.get(sym, current)
-            result[sym] = (current, prev_close)
-    return result, dict(last_call_bytes)
+        meta = live_meta.get(sym)
+        if meta is None:
+            continue
+        current = meta["price"]
+        prev_close, yahoo_current = anchors.get(sym, (current, None))
+        result[sym] = (current, prev_close)
+
+        # Stale check: the last trade behind this quote is too old, so the
+        # "current" price is not current at all.
+        stale = False
+        if meta.get("trade_ts") and is_market_hours(now_et):
+            if now_et.timestamp() - meta["trade_ts"] > STALE_QUOTE_SECONDS:
+                stale = True
+
+        # Dispute check: the provider's live price vs Yahoo's current price.
+        disputed = False
+        if yahoo_current and yahoo_current > 0:
+            if abs(current - yahoo_current) / yahoo_current * 100 > PRICE_DISPUTE_PCT:
+                disputed = True
+
+        if disputed:
+            status = "disputed"
+            note = (f"sources differ: {provider} {current:.4g} vs yahoo {yahoo_current:.4g}")
+        elif stale:
+            status = "stale"
+            note = (f"stale quote (last trade "
+                    f"{datetime.fromtimestamp(meta['trade_ts'], EASTERN):%H:%M %Z})")
+        else:
+            status, note = "ok", None
+        quality[sym] = {"status": status, "note": note, "yahoo_price": yahoo_current}
+    return result, dict(last_call_bytes), quality
 
 
 def send_telegram(token, chat_id, message):
@@ -772,7 +836,7 @@ def main():
           f"via {provider}...")
     record["tickers_checked"] = len(tickers)
 
-    prices, call_bytes = get_prices(tickers, provider=provider, api_key=api_key)
+    prices, call_bytes, quality = get_prices(tickers, provider=provider, api_key=api_key)
 
     if api_key and provider == "twelvedata":
         usage = state.setdefault("daily_usage", {})
@@ -806,6 +870,12 @@ def main():
         pct = (current - prev_close) / prev_close * 100
         print(f"  - {symbol}: ${current:.2f} (prev ${prev_close:.2f}) = {pct:+.2f}%")
 
+        # Trust verdict for this price (stale quote / disputed sources). The
+        # verdict's note is recorded in the run history so a bad number is
+        # visible instead of silently trusted.
+        verdict = quality.get(symbol, {"status": "ok", "note": None})
+        price_note = verdict.get("note")
+
         # --- Direction-aware, step-based alerting (per stock, per day) ---
         # Each stock remembers the % move that last triggered an alert today.
         # It alerts again ONLY when the move intensifies by >= retrigger_step
@@ -824,6 +894,31 @@ def main():
             intensified = abs(pct) >= abs(last_level) + retrigger_step
             should_alert = same_direction and intensified
 
+        # Never alert on a price we don't trust:
+        #  - stale: the last trade behind the quote is too old, so the
+        #    "current" price isn't current at all.
+        #  - disputed: the two sources disagree about whether the move
+        #    happened. A second opinion (Yahoo, delayed ~15 min) must also
+        #    show the move crossing the threshold in the same direction,
+        #    otherwise one bad number could fire a false Telegram alert.
+        #    (If Yahoo is unavailable no dispute can be detected and we alert
+        #    as before.)
+        if should_alert:
+            gate_reason = None
+            if verdict.get("status") == "stale":
+                gate_reason = price_note or "stale quote"
+            elif verdict.get("status") == "disputed":
+                yahoo_price = verdict.get("yahoo_price")
+                if yahoo_price and yahoo_price > 0 and prev_close > 0:
+                    yahoo_pct = (yahoo_price - prev_close) / prev_close * 100
+                    if (pct > 0) != (yahoo_pct > 0) or abs(yahoo_pct) < threshold:
+                        gate_reason = (f"sources disagree on the move: "
+                                       f"{provider} {pct:+.1f}% vs yahoo {yahoo_pct:+.1f}%")
+            if gate_reason:
+                print(f"  -> NOT alerting {symbol}: {gate_reason}")
+                price_note = gate_reason + " - alert suppressed"
+                should_alert = False
+
         if should_alert:
             msg = format_alert(symbol, current, prev_close, pct, threshold, retrigger_step)
             if send_telegram(token, chat_id, msg):
@@ -841,7 +936,7 @@ def main():
             "prev_close": round(prev_close, 4),
             "pct": round(pct, 2),
             "alert": alerted,
-            "note": None,
+            "note": price_note,
             "egress_bytes": call_bytes.get(symbol),
         })
 

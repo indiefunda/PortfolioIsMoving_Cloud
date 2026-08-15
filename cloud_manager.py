@@ -855,7 +855,8 @@ function renderLogs(logs){
         if(p.pct==null) return '<li><b>'+p.symbol+'</b>: '+ (p.note||'no data') + egress +'</li>';
         const cls = p.pct>0?'pos':(p.pct<0?'neg':'');
         return '<li><b>'+p.symbol+'</b>: $'+p.current+' (prev $'+p.prev_close+') = <span class="'+cls+'">'+
-          (p.pct>0?'+':'')+p.pct+'%</span>'+(p.alert?' <span class="badge ok">ALERT</span>':'')+egress+'</li>';
+          (p.pct>0?'+':'')+p.pct+'%</span>'+(p.alert?' <span class="badge ok">ALERT</span>':'')+egress+
+          (p.note?' <span class="badge warn">'+escapeHtml(p.note)+'</span>':'')+'</li>';
       }).join('');
       detail = '<details><summary>Prices seen ('+r.prices.length+')</summary><ul style="margin:6px 0 0;padding-left:18px">'+items+'</ul></details>';
     }
