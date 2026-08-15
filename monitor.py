@@ -817,13 +817,22 @@ def main():
         return
 
     now_et = datetime.now(EASTERN)
+    # Manual test escape hatch: MONITOR_FORCE=1 (or --force) bypasses the
+    # market-hours gate so the panel's "Run now" button and SSH tests work
+    # on weekends/holidays too. cron never sets it, so the schedule keeps
+    # running only during market hours as before.
+    force_run = ("--force" in sys.argv) or (os.environ.get("MONITOR_FORCE") == "1")
     if not is_market_hours(now_et):
         # Outside market hours: exit silently WITHOUT writing a run record.
         # This keeps the run history clean (no "outside hours" spam) and
         # avoids unnecessary disk writes. cron only fires during market-window
         # hours now, so this is just the small DST boundary overshoot.
-        print(f"Skipping: outside market hours ({now_et.strftime('%a %H:%M %Z')}).")
-        return
+        if force_run:
+            print(f"Forced run outside market hours ({now_et.strftime('%a %H:%M %Z')}) "
+                  f"- MONITOR_FORCE=1")
+        else:
+            print(f"Skipping: outside market hours ({now_et.strftime('%a %H:%M %Z')}).")
+            return
 
     state = load_state()
     today = now_et.strftime("%Y-%m-%d")

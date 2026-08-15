@@ -1150,6 +1150,10 @@ class Handler(BaseHTTPRequestHandler):
         a real end-to-end test: it proves the monitor itself works, so if the
         scheduled cron runs don't appear afterwards, the problem is the
         scheduler, not the monitor.
+
+        MONITOR_FORCE=1 bypasses the market-hours gate, so this button works
+        on weekends/holidays too - the run is explicit and user-initiated.
+        (cron never sets it, so the schedule still respects market hours.)
         """
         zone = find_vm_zone()
         if not zone:
@@ -1160,7 +1164,7 @@ class Handler(BaseHTTPRequestHandler):
         # python3 for VMs set up by older scripts.
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", f"cd {home} && (./.venv/bin/python monitor.py 2>&1 || python3 monitor.py 2>&1)",
+            "--command", f"cd {home} && (MONITOR_FORCE=1 ./.venv/bin/python monitor.py 2>&1 || MONITOR_FORCE=1 python3 monitor.py 2>&1)",
             "--quiet"], timeout=120)
         # The monitor writes a run_history record; refresh happens on next load.
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
