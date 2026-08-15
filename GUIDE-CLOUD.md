@@ -205,7 +205,7 @@ Done. ✅
 
 ---
 
-## � Sharing with friends
+## 👥 Sharing with friends
 
 The app is **fully reusable**. Each person runs it on **their own PC**, signs
 in with **their own Google account**, and it creates **their own** VM in
@@ -241,7 +241,7 @@ To share it:
 
 ---
 
-## �📋 Appendix — manual method (if the panel can't create the server)
+## 🛠️📋 Appendix — manual method (if the panel can't create the server)
 
 If the panel's "Create server" button ever fails, you can create it by hand:
 

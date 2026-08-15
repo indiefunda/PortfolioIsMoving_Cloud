@@ -16,6 +16,14 @@ state.json
 run_history.json
 network_usage.json
 
+# Local logs & panel artifacts (never commit these)
+monitor.log
+panel.log
+monitor.lock
+_test_alert.py
+*.tmp
+.*.tmp
+
 # OS
 Thumbs.db
 .DS_Store

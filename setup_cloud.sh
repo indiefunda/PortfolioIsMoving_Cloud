@@ -6,8 +6,8 @@
 #   bash setup_cloud.sh
 #
 # What it does:
-#   1. Installs Python 3, pip, and cron
-#   2. Installs the Python packages (requests, pytz)
+#   1. Installs Python 3, pip, python3-venv, and cron
+#   2. Installs the Python packages (requests, tzdata) - in a venv
 #   3. Installs a cron job that runs monitor.py every 10
 #      minutes during US market hours (Mon-Fri)
 #   4. Runs monitor.py once to confirm it works
@@ -25,7 +25,7 @@ echo "=============================================="
 # --- 1. Install Python + cron
 echo "[1/4] Installing Python and system tools..."
 sudo apt-get update -y
-sudo apt-get install -y python3 python3-pip cron || true
+sudo apt-get install -y python3 python3-pip python3-venv cron || true
 
 # Make sure the cron daemon is actually running AND enabled at boot. On some
 # minimal Debian images, installing cron doesn't start or enable it, which is
@@ -35,31 +35,47 @@ sudo systemctl start cron 2>/dev/null || true
 echo "  cron daemon: $(systemctl is-active cron 2>/dev/null || echo 'not running')"
 echo "  cron at boot: $(systemctl is-enabled cron 2>/dev/null || echo 'not enabled')"
 
-# --- 2. Install Python dependencies system-wide
-echo "[2/4] Installing Python packages (requests, pytz)..."
-# IMPORTANT: install with sudo so the packages go into the system site-packages.
-# If they land in the USER site-packages (~/.local/...), cron cannot import
-# them (cron runs with a minimal environment), and monitor.py crashes with
-# "No module named 'pytz'" every time it runs on schedule. This was the root
-# cause of "the monitor never fires unattended".
-sudo python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null \
-  || sudo python3 -m pip install --upgrade pip
-sudo python3 -m pip install --break-system-packages -r requirements.txt 2>/dev/null \
-  || sudo python3 -m pip install -r requirements.txt
-echo "  pytz import check (as cron would):"
-python3 -c "import pytz, requests; print('  OK - pytz and requests importable')"
+# --- 2. Install Python dependencies
+echo "[2/4] Installing Python packages (requests, tzdata)..."
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Prefer a dedicated virtualenv: no sudo, no --break-system-packages, and the
+# cron job below uses the venv's interpreter so imports always resolve.
+# If python3-venv is missing we fall back to a system-wide install (the old
+# behaviour), which is why the import check runs with whichever interpreter
+# ends up in $PYTHON.
+if python3 -m venv "$PROJECT_DIR/.venv" 2>/dev/null; then
+  echo "  Using a dedicated virtualenv at $PROJECT_DIR/.venv"
+  "$PROJECT_DIR/.venv/bin/python" -m pip install --upgrade pip
+  "$PROJECT_DIR/.venv/bin/python" -m pip install -r requirements.txt
+  PYTHON="$PROJECT_DIR/.venv/bin/python"
+else
+  echo "  python3-venv not available - falling back to a system-wide install."
+  echo "  (If cron later reports 'No module named requests', install python3-venv and re-run this script.)"
+  sudo python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null \
+    || sudo python3 -m pip install --upgrade pip
+  sudo python3 -m pip install --break-system-packages -r requirements.txt 2>/dev/null \
+    || sudo python3 -m pip install -r requirements.txt
+  PYTHON="$(command -v python3)"
+fi
+
+# Dependency check as cron would run it. monitor.py needs zoneinfo to resolve
+# the America/New_York database (tzdata on the system) and the requests
+# package. NOTE: do NOT check for pytz here - the code migrated to zoneinfo
+# and pytz is no longer a dependency (a stale pytz check aborted the whole
+# script on fresh VMs via set -e, so cron never got installed).
+echo "  dependency check (as cron would):"
+"$PYTHON" -c "from zoneinfo import ZoneInfo; ZoneInfo('America/New_York'); import requests; print('  OK - timezone data and requests importable')"
 
 # --- 3. Set up the 10-minute schedule using cron
 echo "[3/4] Setting up the 10-minute schedule (cron)..."
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MONITOR="$PROJECT_DIR/monitor.py"
 LOG="$PROJECT_DIR/monitor.log"
-PYTHON="$(command -v python3)"
 
 # We use cron instead of a systemd timer because cron's schedule syntax is
 # simple and unambiguous, and it has proven far more reliable to install and
-# verify. We install TWO cron jobs (one per DST season) so cron only fires
-# during US market hours; monitor.py does the precise market-hours check.
+# verify. We install ONE cron job whose window covers both DST seasons;
+# monitor.py does the precise market-hours check.
 
 # Remove any old systemd timer/service from earlier versions so they don't
 # conflict or confuse things.

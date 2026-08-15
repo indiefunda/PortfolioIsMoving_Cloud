@@ -18,6 +18,7 @@ Price sources (set in config_local.json -> provider):
 Alerts: Telegram bot (free)
 """
 
+import atexit
 import json
 import os
 import sys
@@ -36,6 +37,7 @@ STATE_FILE = os.path.join(BASE_DIR, "state.json")
 RUN_HISTORY_FILE = os.path.join(BASE_DIR, "run_history.json")
 NETWORK_USAGE_FILE = os.path.join(BASE_DIR, "network_usage.json")
 LOG_FILE = os.path.join(BASE_DIR, "monitor.log")
+LOCK_FILE = os.path.join(BASE_DIR, "monitor.lock")
 
 # Keep only the most recent runs in the history file (keeps it small on disk).
 RUN_HISTORY_LIMIT = 500
@@ -45,9 +47,10 @@ RUN_HISTORY_LIMIT = 500
 # See https://cloud.google.com/free/docs/free-cloud-features
 FREE_EGRESS_MONTHLY_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
 
-# US Eastern timezone (NY market). Using the standard library's zoneinfo means
-# monitor.py has NO third-party timezone dependency, so it imports cleanly even
-# under cron's minimal environment (cron historically failed to import pytz).
+# US Eastern timezone (NY market). zoneinfo uses the OS timezone database on
+# Linux (always present on Debian) and the 'tzdata' PyPI package on Windows,
+# so it imports cleanly even under cron's minimal environment (cron
+# historically failed to import pytz).
 EASTERN = ZoneInfo("America/New_York")
 
 # Telegram API
@@ -106,8 +109,73 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    # Write atomically: write to a temp file, fsync, then os.replace() over
+    # the real path. A crash mid-write can never leave a truncated/corrupt
+    # JSON that _read_json would silently reset to defaults.
+    tmp = os.path.join(os.path.dirname(path) or ".",
+                       "." + os.path.basename(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _acquire_single_instance():
+    """
+    Try to become the only running monitor instance.
+
+    Returns a handle the caller must release (via _release_single_instance),
+    or None if another run is already in progress. On POSIX this uses a
+    non-blocking flock; on Windows (no fcntl) it falls back to an
+    exclusive-create pidfile with a staleness check so a crashed run's file
+    can't block the next one forever.
+    """
+    try:
+        import fcntl
+        fh = open(LOCK_FILE, "w", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.write(str(os.getpid()))
+            fh.flush()
+            return fh
+        except OSError:
+            fh.close()
+            return None
+    except ImportError:
+        pass  # no fcntl -> use the pidfile fallback below
+
+    # Windows fallback: exclusive-create pidfile.
+    try:
+        if os.path.exists(LOCK_FILE):
+            try:
+                stale_pid = int(open(LOCK_FILE, encoding="utf-8").read().strip() or "0")
+            except (OSError, ValueError):
+                stale_pid = 0
+            if stale_pid:
+                try:
+                    os.kill(stale_pid, 0)  # raises if that pid is gone
+                    return None           # another instance is still alive
+                except OSError:
+                    pass                  # stale -> overwrite below
+        fh = open(LOCK_FILE, "x", encoding="utf-8")
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+    except (FileExistsError, OSError):
+        return None
+
+
+def _release_single_instance(fh):
+    try:
+        if fh is not None:
+            fh.close()
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+    except Exception:
+        pass
 
 
 def load_config():
@@ -403,13 +471,16 @@ def _fetch_twelvedata(symbols, api_key):
             data = resp.json()
             if isinstance(data, dict) and "price" in data:
                 live[chunk[0].upper()] = float(data["price"])
-                last_call_bytes[chunk[0].upper()] = body_bytes
+                # The whole chunk came back in ONE response body; attribute
+                # an equal share of its bytes to each symbol in the chunk so
+                # the per-symbol display doesn't overcount by 8x.
+                last_call_bytes[chunk[0].upper()] = body_bytes // len(chunk)
             else:
                 # A batch of multiple symbols in one response body.
                 for sym, q in data.items():
                     if isinstance(q, dict) and "price" in q:
                         live[sym.upper()] = float(q["price"])
-                        last_call_bytes[sym.upper()] = body_bytes
+                        last_call_bytes[sym.upper()] = body_bytes // len(chunk)
         except Exception as exc:
             print(f"  [error] twelvedata price: {exc}", file=sys.stderr)
 
@@ -512,7 +583,6 @@ def _fetch_yahoo_anchor(symbols):
     back after a data glitch). This is the anchor every % move is measured
     against, and it resets correctly each trading day.
     """
-    global last_call_bytes
     anchors = {}
     for sym in symbols:
         sym = sym.upper()
@@ -524,7 +594,11 @@ def _fetch_yahoo_anchor(symbols):
             prev_close = _last_completed_close(chart)
             if prev_close:
                 anchors[sym] = prev_close
-                last_call_bytes[sym] = len(resp.content)
+                # NOTE: deliberately do NOT record this anchor call's bytes in
+                # last_call_bytes. The anchor is a shared/overhead call; the
+                # per-symbol byte figure should reflect the live-price call
+                # from the configured provider (finnhub/twelvedata), not get
+                # overwritten by the anchor's response size.
         except Exception as exc:
             print(f"  [error] yahoo anchor {sym}: {exc}", file=sys.stderr)
     return anchors
@@ -608,6 +682,16 @@ def is_market_hours(now_et):
 
 
 def main():
+    # Single-instance guard: if a previous run is still going (overlapping
+    # cron fire, or the panel's "Run now" hitting at the same minute as
+    # cron), skip instead of sending duplicate alerts or racing the JSON
+    # files. The handle is released automatically on every exit path.
+    lock_fh = _acquire_single_instance()
+    if lock_fh is None:
+        print("Another monitor run is already in progress - skipping this run.")
+        return
+    atexit.register(_release_single_instance, lock_fh)
+
     start_time = datetime.now(EASTERN)
     start_egress = read_egress_bytes()
     record = {

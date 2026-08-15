@@ -15,17 +15,23 @@ app shows install instructions.
 """
 
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config_local.json")
 SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
+PANEL_LOG_FILE = os.path.join(BASE_DIR, "panel.log")
+PANEL_LOG_MAX_BYTES = 1024 * 1024
 PORT = 8000
 
 # VM defaults
@@ -79,8 +85,30 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    # Write atomically (temp file + os.replace) so a crash mid-write can't
+    # leave a corrupt JSON that load_config/load_secrets silently reset.
+    tmp = os.path.join(os.path.dirname(path) or ".",
+                       "." + os.path.basename(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _log_panel(message):
+    """Append one line to the panel's log file, keeping it bounded ~1 MB."""
+    try:
+        with open(PANEL_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+        if os.path.getsize(PANEL_LOG_FILE) > PANEL_LOG_MAX_BYTES:
+            with open(PANEL_LOG_FILE, "rb") as f:
+                f.seek(-PANEL_LOG_MAX_BYTES // 2, os.SEEK_END)
+                tail = f.read()
+            with open(PANEL_LOG_FILE, "wb") as f:
+                f.write(tail)
+    except Exception:
+        pass
 
 
 def load_config():
@@ -135,14 +163,38 @@ def gcloud_available():
     return _find_gcloud() is not None
 
 
+# Serialize gcloud invocations: the panel serves concurrent requests
+# (ThreadingHTTPServer), and without a lock a burst of clicks would spawn
+# dozens of gcloud processes at once. Commands are short; serializing them
+# throttles the flood instead of letting it pile up.
+GCLOUD_LOCK = threading.Lock()
+
+# Tiny TTL cache for the slow "read" endpoints (/api/status, /api/logs,
+# /api/network, /api/timer). Each of those spawns several gcloud/SSH
+# subprocesses, so without caching every refresh is expensive and spammable.
+_cache = {}
+
+
+def _cached(key, ttl_seconds, fn):
+    now = time.time()
+    entry = _cache.get(key)
+    if entry is not None and now - entry[0] < ttl_seconds:
+        return entry[1]
+    value = fn()
+    _cache[key] = (now, value)
+    return value
+
+
 def run_gcloud(args, timeout=120):
     """Run a gcloud command and return (success, stdout, stderr)."""
     gcloud = _find_gcloud()
     if not gcloud:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
     cmd = [gcloud] + args
+    _log_panel(f"gcloud {' '.join(args[:5])} (timeout {timeout}s)")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        with GCLOUD_LOCK:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.returncode == 0, proc.stdout, proc.stderr
     except FileNotFoundError:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
@@ -367,22 +419,34 @@ def compute_next_cron_utc(cron_line, now=None):
     try:
         minutes = _expand_cron_field(min_field, 0, 59)
         hours = _expand_cron_field(hour_field, 0, 23)
+        doms = _expand_cron_field(dom_field, 1, 31)
         months = _expand_cron_field(mon_field, 1, 12)
         dows = _expand_cron_field(dow_field, 0, 6)  # cron: 0=Sun..6=Sat
-        # day-of-month: only handle '*' (all days) simply; anything else we
-        # treat as all days to avoid over-engineering.
     except Exception:
         return None
-    if not minutes or not hours or not months or not dows:
+    if not minutes or not hours or not doms or not months or not dows:
         return None
-    now = now or datetime.utcnow()
+    dom_star = dom_field.strip() in ("*", "")
+    dow_star = dow_field.strip() in ("*", "")
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     for day_offset in range(0, 366):
         d = now + timedelta(days=day_offset)
         if d.month not in months:
             continue
         py_dow = d.weekday()          # Mon=0..Sun=6
         cron_dow = (py_dow + 1) % 7  # Sun=0..Sat=6
-        if cron_dow not in dows:
+        # Standard cron day matching: when BOTH dom and dow are restricted
+        # the day matches if EITHER matches; when only one is restricted it
+        # rules alone. (This mirrors Vixie cron's behaviour.)
+        if dom_star and dow_star:
+            day_ok = True
+        elif dom_star:
+            day_ok = cron_dow in dows
+        elif dow_star:
+            day_ok = d.day in doms
+        else:
+            day_ok = (d.day in doms) or (cron_dow in dows)
+        if not day_ok:
             continue
         for h in sorted(hours):
             if day_offset == 0 and h < now.hour:
@@ -538,7 +602,7 @@ HTML = """<!DOCTYPE html>
   <div class="card">
     <h2>5. Usage & health</h2>
     <div class="status" id="usageStatus">—</div>
-    <button class="btn-ghost" onclick="checkUsage()">� Open my real Google billing page</button>
+    <button class="btn-ghost" onclick="checkUsage()">📊 Open my real Google billing page</button>
     <div class="hint">Opens Google's official billing console in a new tab — the real source of truth for your cost.</div>
     <button class="btn-ghost" onclick="testAlert()">📲 Send test Telegram alert</button>
     <div class="log" id="log">Command output will appear here.</div>
@@ -626,11 +690,16 @@ async function createVM(){
   refreshStatus(); }
 
 async function uploadConfig(){
+  const p = $('provider').value;
+  const apiKey = $('apikey').value.trim();
   const d = await api('/api/upload', {
     tickers, threshold_pct: parseFloat($('threshold').value)||5.0,
     retrigger_step_pct: parseFloat($('retriggerStep').value)||3.0,
-    enabled: $('enabledToggle').checked, provider: $('provider').value,
-    finnhub_key: $('apikey').value.trim(), twelvedata_key: null,
+    enabled: $('enabledToggle').checked, provider: p,
+    // Send the key for the ACTIVE provider only; null leaves the other
+    // provider's stored key untouched so you can switch back later.
+    finnhub_key: (p === 'finnhub') ? apiKey : null,
+    twelvedata_key: (p === 'twelvedata') ? apiKey : null,
     telegram_bot_token: $('token').value.trim(), telegram_chat_id: $('chatid').value.trim(),
   });
   $('log').textContent = d.output || '';
@@ -815,7 +884,12 @@ load();
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args): pass
+    def log_message(self, fmt, *args):
+        # Log requests to the bounded panel.log instead of stderr, so a
+        # broken panel is debuggable without spamming the console.
+        code = args[0] if args else "?"
+        _log_panel(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                   f"{self.client_address[0]} {self.command} {self.path} -> {code}")
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
@@ -840,18 +914,23 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/config":
             self._send_json({"config": load_config(), "secrets": load_secrets()})
         elif parsed.path == "/api/status":
-            self._send_json({
+            # Cached 10s: every panel refresh hits this and it runs 3+ gcloud
+            # subprocesses; the VM status changes slowly, so fresh-ish is fine.
+            self._send_json(_cached("status", 10, lambda: {
                 "gcloud": gcloud_available(),
                 "auth": auth_status(),
                 "vm": vm_status(),
-            })
+            }))
         elif parsed.path == "/api/logs":
-            self._send_json({"ok": True, "logs": fetch_vm_run_history()})
+            self._send_json(_cached("logs", 20, lambda: {
+                "ok": True, "logs": fetch_vm_run_history()}))
         elif parsed.path == "/api/network":
-            self._send_json({"ok": True, "network": fetch_vm_network_usage(),
-                             "monthly_limit_bytes": 1 * 1024 * 1024 * 1024})
+            self._send_json(_cached("network", 20, lambda: {
+                "ok": True, "network": fetch_vm_network_usage(),
+                "monthly_limit_bytes": 1 * 1024 * 1024 * 1024}))
         elif parsed.path == "/api/timer":
-            self._send_json({"ok": True, "timer": fetch_vm_timer_status()})
+            self._send_json(_cached("timer", 20, lambda: {
+                "ok": True, "timer": fetch_vm_timer_status()}))
         elif parsed.path == "/api/auth":
             ok, out, err = run_gcloud(["auth", "login", "--no-launch-browser",
                                        "--brief"], timeout=300)
@@ -1038,11 +1117,12 @@ class Handler(BaseHTTPRequestHandler):
         ok, out, err = run_gcloud([
             "compute", "scp", "--zone", zone, script_path,
             f"{VM_NAME}:{home}/", "--quiet"], timeout=120)
-        # Run it
+        # Run it. Prefer the venv python installed by setup_cloud.sh (new
+        # VMs); fall back to python3 for VMs set up by older scripts.
         if ok:
             ok2, out2, err2 = run_gcloud([
                 "compute", "ssh", "--zone", zone, VM_NAME,
-                "--command", f"cd {home} && python3 _test_alert.py",
+                "--command", f"cd {home} && (./.venv/bin/python _test_alert.py 2>&1 || python3 _test_alert.py 2>&1)",
                 "--quiet"], timeout=120)
             ok = ok2; out += out2; err += err2
             # Clean up the script on the VM
@@ -1069,9 +1149,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
             return
         home = get_vm_home(zone)
+        # Prefer the venv python installed by setup_cloud.sh; fall back to
+        # python3 for VMs set up by older scripts.
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", f"cd {home} && python3 monitor.py 2>&1",
+            "--command", f"cd {home} && (./.venv/bin/python monitor.py 2>&1 || python3 monitor.py 2>&1)",
             "--quiet"], timeout=120)
         # The monitor writes a run_history record; refresh happens on next load.
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
@@ -1080,31 +1162,97 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/upload":
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
-            cfg = load_config(); secrets = load_secrets()
-            cfg["tickers"] = [t.strip().upper() for t in data.get("tickers", []) if t.strip()]
-            cfg["threshold_pct"] = float(data.get("threshold_pct", 5.0))
-            cfg["retrigger_step_pct"] = float(data.get("retrigger_step_pct", 3.0))
-            cfg["enabled"] = bool(data.get("enabled", True))
-            cfg["provider"] = data.get("provider", "finnhub")
-            provider = cfg["provider"]
-            if data.get("finnhub_key") is not None:
-                secrets["finnhub_key"] = data["finnhub_key"]
-            if data.get("twelvedata_key") is not None:
-                secrets["twelvedata_key"] = data["twelvedata_key"]
-            secrets["telegram_bot_token"] = data.get("telegram_bot_token", "")
-            secrets["telegram_chat_id"] = data.get("telegram_chat_id", "")
-            save_config(cfg); save_secrets(secrets)
-            # Now upload to VM
-            project = get_project()
-            if not project:
-                self._send_json({"ok": False, "error": "Not authenticated to Google."})
-                return
-            ok, out, err = self._deploy_to_vm(project)
-            self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
+            self._handle_upload()
         else:
             self._send_json({"error": "not found"}, 404)
+
+    # ---- /api/upload input validation ----
+    MAX_BODY_BYTES = 512 * 1024
+    VALID_PROVIDERS = ("finnhub", "twelvedata", "yahoo")
+    MAX_TICKERS = 50
+    TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,12}$")
+
+    @staticmethod
+    def _clean_str(value, max_len=200, default=""):
+        if not isinstance(value, str):
+            return default
+        return value.strip()[:max_len]
+
+    @staticmethod
+    def _clean_pct(value, default, low=0.1, high=100.0):
+        """Parse a percentage; reject garbage and NaN/Inf, clamp to a sane range."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(v):
+            return default
+        return min(max(v, low), high)
+
+    def _handle_upload(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length > self.MAX_BODY_BYTES:
+            self._send_json({"ok": False, "error": "Request body too large."}, 413)
+            return
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            data = json.loads(raw)
+        except Exception:
+            self._send_json({"ok": False, "error": "Invalid JSON body."}, 400)
+            return
+        if not isinstance(data, dict):
+            self._send_json({"ok": False, "error": "Body must be a JSON object."}, 400)
+            return
+
+        cfg = load_config()
+        secrets = load_secrets()
+
+        # Tickers: must be a list of short stock symbols; anything that isn't
+        # a valid symbol is dropped rather than stored (stops junk/code from
+        # ever reaching the dashboard or the VM).
+        raw_tickers = data.get("tickers", [])
+        if not isinstance(raw_tickers, list):
+            raw_tickers = []
+        tickers = []
+        for t in raw_tickers:
+            if not isinstance(t, str):
+                continue
+            t = t.strip().upper()
+            if t and self.TICKER_RE.match(t) and t not in tickers:
+                tickers.append(t)
+            if len(tickers) >= self.MAX_TICKERS:
+                break
+        cfg["tickers"] = tickers
+
+        cfg["threshold_pct"] = self._clean_pct(data.get("threshold_pct"), 5.0)
+        cfg["retrigger_step_pct"] = self._clean_pct(data.get("retrigger_step_pct"), 3.0)
+
+        raw_enabled = data.get("enabled", True)
+        cfg["enabled"] = raw_enabled if isinstance(raw_enabled, bool) else True
+
+        provider = self._clean_str(data.get("provider"), max_len=20, default="finnhub")
+        if provider not in self.VALID_PROVIDERS:
+            provider = "finnhub"
+        cfg["provider"] = provider
+
+        if data.get("finnhub_key") is not None:
+            secrets["finnhub_key"] = self._clean_str(data["finnhub_key"], max_len=200)
+        if data.get("twelvedata_key") is not None:
+            secrets["twelvedata_key"] = self._clean_str(data["twelvedata_key"], max_len=200)
+        secrets["telegram_bot_token"] = self._clean_str(data.get("telegram_bot_token"), max_len=200)
+        secrets["telegram_chat_id"] = self._clean_str(data.get("telegram_chat_id"), max_len=100)
+        save_config(cfg)
+        save_secrets(secrets)
+        # Now upload to VM
+        project = get_project()
+        if not project:
+            self._send_json({"ok": False, "error": "Not authenticated to Google."})
+            return
+        ok, out, err = self._deploy_to_vm(project)
+        self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
 
 
 def main():
@@ -1124,8 +1272,14 @@ def main():
     try:
         server = ThreadingHTTPServer(("", port), Handler)
     except OSError:
-        port = 8001
-        server = ThreadingHTTPServer(("", port), Handler)
+        # Fail loudly instead of silently moving to another port: the launcher
+        # (start_cloud.bat) opens http://localhost:8000, so a silent fallback
+        # would open the browser to the wrong page.
+        print(f"Could not start the panel on port {port} - it is probably in use.")
+        print("Close the other panel (or anything using port 8000) and try again.")
+        print("To use a different port, change PORT in cloud_manager.py.")
+        return
+    _log_panel(f"panel started on http://localhost:{port}")
     print(f"PortfolioIsMoving Cloud panel: http://localhost:{port}")
     print("Press Ctrl+C to stop.")
     server.serve_forever()
