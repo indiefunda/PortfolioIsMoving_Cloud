@@ -163,26 +163,33 @@ def gcloud_available():
     return _find_gcloud() is not None
 
 
-# Serialize gcloud invocations: the panel serves concurrent requests
-# (ThreadingHTTPServer), and without a lock a burst of clicks would spawn
-# dozens of gcloud processes at once. Commands are short; serializing them
-# throttles the flood instead of letting it pile up.
-GCLOUD_LOCK = threading.Lock()
-
-# Tiny TTL cache for the slow "read" endpoints (/api/status, /api/logs,
+# TTL cache for the slow "read" endpoints (/api/status, /api/logs,
 # /api/network, /api/timer). Each of those spawns several gcloud/SSH
 # subprocesses, so without caching every refresh is expensive and spammable.
+#
+# IMPORTANT: we deliberately do NOT serialize gcloud calls globally. The
+# panel's initial page load fires /api/status, /api/timer, /api/logs and
+# /api/network at the same time; a global lock made the fast /api/status
+# wait behind slow SSH commands (each can take up to its 60s timeout when
+# the VM is stopped), which froze the panel on "Checking...". Instead,
+# coalescing is per cache key: parallel requests for the SAME endpoint share
+# one computation, while different endpoints still run concurrently.
 _cache = {}
+_key_locks = {}
+_cache_guard = threading.Lock()
 
 
 def _cached(key, ttl_seconds, fn):
-    now = time.time()
-    entry = _cache.get(key)
-    if entry is not None and now - entry[0] < ttl_seconds:
-        return entry[1]
-    value = fn()
-    _cache[key] = (now, value)
-    return value
+    with _cache_guard:
+        lock = _key_locks.setdefault(key, threading.Lock())
+    with lock:
+        now = time.time()
+        entry = _cache.get(key)
+        if entry is not None and now - entry[0] < ttl_seconds:
+            return entry[1]
+        value = fn()
+        _cache[key] = (now, value)
+        return value
 
 
 def run_gcloud(args, timeout=120):
@@ -193,8 +200,7 @@ def run_gcloud(args, timeout=120):
     cmd = [gcloud] + args
     _log_panel(f"gcloud {' '.join(args[:5])} (timeout {timeout}s)")
     try:
-        with GCLOUD_LOCK:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.returncode == 0, proc.stdout, proc.stderr
     except FileNotFoundError:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
